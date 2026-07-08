@@ -164,11 +164,13 @@ struct KernelProp {
     }
 };
 
-std::unordered_map<int64_t,
-    std::pair<
-        std::unique_ptr<JITTPImpl<JITKernel>>,
-        KernelProp
-    >> tp_cache;
+struct CachedTP {
+    std::unique_ptr<JITTPImpl<JITKernel>> impl;
+    KernelProp prop;
+    std::string json_payload;
+};
+
+std::unordered_map<int64_t, CachedTP> tp_cache;
 
 std::unordered_map<int64_t,
     std::pair<
@@ -186,8 +188,9 @@ std::pair<JITTPImpl<JITKernel>*, KernelProp>
         const std::lock_guard<std::mutex> lock(mut);
         auto it = tp_cache.find(hash); 
         if (it == tp_cache.end()) {
+            std::string incoming_json(json_payload);
             std::string err;
-            json root = json::parse(std::string(json_payload), err);
+            json root = json::parse(incoming_json, err);
             if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
 
             std::string kernel_src = root["kernel"].string_value();
@@ -202,12 +205,18 @@ std::pair<JITTPImpl<JITKernel>*, KernelProp>
                 backward_cfg,
                 dbackward_cfg,
                 kernel_prop_map);
-            tp_cache.insert({hash,
-                std::make_pair(std::move(jit_tp_impl), 
-                KernelProp(kernel_prop_map, is_convolution))});
+            tp_cache.emplace(hash,
+                CachedTP{
+                    std::move(jit_tp_impl),
+                    KernelProp(kernel_prop_map, is_convolution),
+                    std::move(incoming_json),
+                });
             it = tp_cache.find(hash);
+        } else if (it->second.json_payload != json_payload) {
+            throw std::runtime_error(
+                "OpenEquivariance JAX TP cache collision: same hash, different kernel JSON");
         }
-        return {it->second.first.get(), it->second.second};
+        return {it->second.impl.get(), it->second.prop};
     }
 }
 
@@ -340,9 +349,9 @@ ffi::Error tp_backward_impl(
         check_tensor(*W_grad, {num_batch, k.weight_numel}, k.weight_dtype, "W_grad");
     }
 
-    if (k.shared_weights) {
-        zero_buffer(*W_grad, stream);
-    } 
+    zero_buffer(*L1_grad, stream);
+    zero_buffer(*L2_grad, stream);
+    zero_buffer(*W_grad, stream);
 
     jit_kernel->backward(
             num_batch,
@@ -391,9 +400,10 @@ ffi::Error tp_double_backward_impl(
         check_tensor(W_dgrad, {num_batch, k.weight_numel}, k.weight_dtype, "W_dgrad");
     }
 
-    if (k.shared_weights) {
-        zero_buffer(*W_grad, stream);
-    } 
+    zero_buffer(*L1_grad, stream);
+    zero_buffer(*L2_grad, stream);
+    zero_buffer(*W_grad, stream);
+    zero_buffer(*L3_dgrad, stream);
 
     jit_kernel->double_backward(
             num_batch,
