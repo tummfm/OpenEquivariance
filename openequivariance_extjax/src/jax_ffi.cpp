@@ -6,11 +6,16 @@
 #include <unordered_map>
 #include <iostream>
 
+#ifndef OEQ_NO_PYTHON_MODULE
 #include "nanobind/nanobind.h"
+#endif
 #include "xla/ffi/api/ffi.h"
 #include "json11/json11.hpp"
+#include "ffi_abi.h"
 
+#ifndef OEQ_NO_PYTHON_MODULE
 namespace nb = nanobind;
+#endif
 namespace ffi = xla::ffi;
 using json = json11::Json;
 
@@ -177,15 +182,24 @@ std::unordered_map<int64_t,
     >> conv_cache;
 std::mutex mut;
 
+template <typename Cache, typename Factory>
+typename Cache::mapped_type &find_or_compile_cached(
+    Cache &cache, int64_t hash, Factory &&factory) {
+    const std::lock_guard<std::mutex> lock(mut);
+    auto it = cache.find(hash);
+    if (it == cache.end()) {
+        it = cache.emplace(hash, std::forward<Factory>(factory)()).first;
+    }
+    return it->second;
+}
+
 std::pair<JITTPImpl<JITKernel>*, KernelProp> 
     compile_tp_with_caching(std::string_view json_payload,
                     int64_t hash,
                     bool is_convolution) {
     
-    {
-        const std::lock_guard<std::mutex> lock(mut);
-        auto it = tp_cache.find(hash); 
-        if (it == tp_cache.end()) {
+    auto &cached = find_or_compile_cached(
+        tp_cache, hash, [&] {
             std::string err;
             json root = json::parse(std::string(json_payload), err);
             if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
@@ -202,13 +216,10 @@ std::pair<JITTPImpl<JITKernel>*, KernelProp>
                 backward_cfg,
                 dbackward_cfg,
                 kernel_prop_map);
-            tp_cache.insert({hash,
-                std::make_pair(std::move(jit_tp_impl), 
-                KernelProp(kernel_prop_map, is_convolution))});
-            it = tp_cache.find(hash);
-        }
-        return {it->second.first.get(), it->second.second};
-    }
+            return std::make_pair(std::move(jit_tp_impl),
+                                  KernelProp(kernel_prop_map, is_convolution));
+        });
+    return {cached.first.get(), cached.second};
 }
 
 std::pair<JITConvImpl<JITKernel>*, KernelProp> 
@@ -216,10 +227,8 @@ std::pair<JITConvImpl<JITKernel>*, KernelProp>
                     int64_t hash,
                     bool is_convolution) {
     
-    {
-        const std::lock_guard<std::mutex> lock(mut);
-        auto it = conv_cache.find(hash); 
-        if (it == conv_cache.end()) {
+    auto &cached = find_or_compile_cached(
+        conv_cache, hash, [&] {
             std::string err;
             json root = json::parse(std::string(json_payload), err);
             if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
@@ -236,13 +245,10 @@ std::pair<JITConvImpl<JITKernel>*, KernelProp>
                 backward_cfg,
                 dbackward_cfg,
                 kernel_prop_map);
-            conv_cache.insert({hash,
-                std::make_pair(std::move(jit_conv_impl), 
-                KernelProp(kernel_prop_map, is_convolution))});
-            it = conv_cache.find(hash);
-        }
-        return {it->second.first.get(), it->second.second};
-    }
+            return std::make_pair(std::move(jit_conv_impl),
+                                  KernelProp(kernel_prop_map, is_convolution));
+        });
+    return {cached.first.get(), cached.second};
 }
 
 inline void check_tensor(const ffi::AnyBuffer &buffer, 
@@ -662,6 +668,31 @@ bool is_hip() {
 
 // --------------------- FFI Bindings --------------------------
 
+ffi::Error tp_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
+    compile_tp_with_caching(kernel_json, hash, false);
+    return ffi::Error::Success();
+}
+
+ffi::Error conv_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
+    compile_conv_with_caching(kernel_json, hash, true);
+    return ffi::Error::Success();
+}
+
+#define OEQ_STOCK_INITIALIZE_ATTRIBUTES                                                \
+    .Ctx<ffi::PlatformStream<stream_t>>()                                              \
+        .Attr<std::string_view>("kernel")                                              \
+        .Attr<int64_t>("hash")
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tp_initialize, tp_initialize_impl,
+    ffi::Ffi::BindInitialize() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    conv_initialize, conv_initialize_impl,
+    ffi::Ffi::BindInitialize() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+
+#undef OEQ_STOCK_INITIALIZE_ATTRIBUTES
+
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     conv_forward, conv_forward_impl,
     ffi::Ffi::Bind()
@@ -720,17 +751,47 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
+namespace {
+
+#define OEQ_FFI_HANDLER(NAME, INITIALIZE)                                             \
+    {#NAME, reinterpret_cast<void*>(INITIALIZE), reinterpret_cast<void*>(NAME)}
+
+const OeqFfiHandler kFfiHandlers[] = {
+    OEQ_FFI_HANDLER(tp_forward, tp_initialize),
+    OEQ_FFI_HANDLER(tp_backward, tp_initialize),
+    OEQ_FFI_HANDLER(tp_double_backward, tp_initialize),
+    OEQ_FFI_HANDLER(conv_forward, conv_initialize),
+    OEQ_FFI_HANDLER(conv_backward, conv_initialize),
+    OEQ_FFI_HANDLER(conv_double_backward, conv_initialize),
+};
+
+#undef OEQ_FFI_HANDLER
+
+const OeqFfiHandlerTable kFfiHandlerTable = {
+    OEQ_FFI_ABI_VERSION,
+    sizeof(kFfiHandlers) / sizeof(kFfiHandlers[0]),
+    kFfiHandlers,
+};
+
+}  // namespace
+
+extern "C" const OeqFfiHandlerTable* oeq_ffi_handler_table() {
+    return &kFfiHandlerTable;
+}
+
 // --------------------- NB Module --------------------------
+#ifndef OEQ_NO_PYTHON_MODULE
 NB_MODULE(openequivariance_extjax, m) {
     m.def("registrations", []() {
         nb::dict registrations;
-        registrations["tp_forward"] = nb::capsule(reinterpret_cast<void *>(tp_forward));
-        registrations["tp_backward"] = nb::capsule(reinterpret_cast<void *>(tp_backward));
-        registrations["tp_double_backward"] = nb::capsule(reinterpret_cast<void *>(tp_double_backward));
-
-        registrations["conv_forward"] = nb::capsule(reinterpret_cast<void *>(conv_forward));
-        registrations["conv_backward"] = nb::capsule(reinterpret_cast<void *>(conv_backward));
-        registrations["conv_double_backward"] = nb::capsule(reinterpret_cast<void *>(conv_double_backward));
+        const auto* handlers = oeq_ffi_handler_table();
+        for (uint32_t index = 0; index < handlers->handler_count; ++index) {
+            const auto& handler = handlers->handlers[index];
+            nb::dict stages;
+            stages["initialize"] = nb::capsule(handler.initialize);
+            stages["execute"] = nb::capsule(handler.execute);
+            registrations[handler.name] = stages;
+        }
         return registrations;
     });
     m.def("is_hip", &is_hip);
@@ -750,3 +811,4 @@ NB_MODULE(openequivariance_extjax, m) {
         .def("stop_clock_get_elapsed", &GPUTimer::stop_clock_get_elapsed)
         .def("clear_L2_cache", &GPUTimer::clear_L2_cache);
 }
+#endif
