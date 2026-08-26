@@ -1,10 +1,21 @@
+#include <atomic>
+#include <charconv>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <memory>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
-#include <iostream>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #ifndef OEQ_NO_PYTHON_MODULE
 #include "nanobind/nanobind.h"
@@ -152,7 +163,8 @@ struct KernelProp {
     KernelProp() {}
 
     KernelProp(
-        std::unordered_map<string, int64_t> &kernel_dims, bool is_convolution):
+        const std::unordered_map<string, int64_t> &kernel_dims,
+        bool is_convolution):
             L1_dim(kernel_dims.at("L1_dim")),
             L2_dim(kernel_dims.at("L2_dim")),    
             L3_dim(kernel_dims.at("L3_dim")),
@@ -169,87 +181,444 @@ struct KernelProp {
     }
 };
 
-std::unordered_map<int64_t,
-    std::pair<
-        std::unique_ptr<JITTPImpl<JITKernel>>,
-        KernelProp
-    >> tp_cache;
+namespace {
 
-std::unordered_map<int64_t,
-    std::pair<
-        std::unique_ptr<JITConvImpl<JITKernel>>,
-        KernelProp
-    >> conv_cache;
-std::mutex mut;
+// Selects the dense tensor-product or sparse-convolution payload layout.
+enum class KernelFamily { kTensorProduct, kConvolution };
 
-template <typename Cache, typename Factory>
-typename Cache::mapped_type &find_or_compile_cached(
-    Cache &cache, int64_t hash, Factory &&factory) {
-    const std::lock_guard<std::mutex> lock(mut);
-    auto it = cache.find(hash);
-    if (it == cache.end()) {
-        it = cache.emplace(hash, std::forward<Factory>(factory)()).first;
+// Static JSON decoded and validated once at instantiation. It contains all
+// source and launch data needed to create a device-specific launcher later.
+struct ParsedKernel {
+    std::string source;
+    KernelLaunchConfig forward_config;
+    KernelLaunchConfig backward_config;
+    KernelLaunchConfig double_backward_config;
+    KernelProp properties;
+    int opt_level;
+};
+
+KernelLaunchConfig parse_launch_config(const json& config) {
+    auto values = parse_json_config(config);
+    return KernelLaunchConfig(
+        values.at("num_blocks"), values.at("num_threads"), values.at("smem"));
+}
+
+ParsedKernel parse_kernel(std::string_view payload, KernelFamily family) {
+    std::string error;
+    json root = json::parse(std::string(payload), error);
+    if (!error.empty()) {
+        throw std::runtime_error("JSON Parse Error: " + error);
     }
-    return it->second;
+
+    auto dimensions = parse_json_config(root["kernel_prop"]);
+    return {
+        root["kernel"].string_value(),
+        parse_launch_config(root["forward_config"]),
+        parse_launch_config(root["backward_config"]),
+        parse_launch_config(root["double_backward_config"]),
+        KernelProp(dimensions, family == KernelFamily::kConvolution),
+        static_cast<int>(dimensions.at("opt_level")),
+    };
 }
 
-std::pair<JITTPImpl<JITKernel>*, KernelProp> 
-    compile_tp_with_caching(std::string_view json_payload,
-                    int64_t hash,
-                    bool is_convolution) {
-    
-    auto &cached = find_or_compile_cached(
-        tp_cache, hash, [&] {
-            std::string err;
-            json root = json::parse(std::string(json_payload), err);
-            if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
+#ifdef CUDA_BACKEND
 
-            std::string kernel_src = root["kernel"].string_value();
-            auto forward_cfg = parse_json_config(root["forward_config"]);
-            auto backward_cfg = parse_json_config(root["backward_config"]);
-            auto dbackward_cfg = parse_json_config(root["double_backward_config"]);
-            auto kernel_prop_map = parse_json_config(root["kernel_prop"]);
+int compiler_worker_count() {
+    // Read this setting once when the pool is created.
+    // The default is 16. The accepted range is 1--64.
+    constexpr int kDefaultWorkerCount = 16;
+    constexpr int kMaximumWorkerCount = 64;
+    const char* setting = std::getenv("OEQ_JAX_COMPILER_THREADS");
+    if (setting == nullptr) {
+        return kDefaultWorkerCount;
+    }
 
-            auto jit_tp_impl = std::make_unique<JITTPImpl<JITKernel>>(
-                kernel_src,
-                forward_cfg,
-                backward_cfg,
-                dbackward_cfg,
-                kernel_prop_map);
-            return std::make_pair(std::move(jit_tp_impl),
-                                  KernelProp(kernel_prop_map, is_convolution));
+    std::string_view value(setting);
+    int worker_count;
+    const auto [end, error] = std::from_chars(
+        value.data(), value.data() + value.size(), worker_count);
+    if (error != std::errc() || end != value.data() + value.size() ||
+        worker_count < 1 || worker_count > kMaximumWorkerCount) {
+        throw std::invalid_argument(
+            "OEQ_JAX_COMPILER_THREADS must be an integer from 1 to 64");
+    }
+    return worker_count;
+}
+
+// Bounded host pool for overlapping independent NVRTC compilations.
+class CompilerPool {
+public:
+    static CompilerPool& instance() {
+        static CompilerPool pool;
+        return pool;
+    }
+
+    void submit(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            tasks_.push_back(std::move(task));
+        }
+        ready_.notify_one();
+    }
+
+private:
+    CompilerPool() {
+        const int worker_count = compiler_worker_count();
+        try {
+            for (int index = 0; index < worker_count; ++index) {
+                workers_.emplace_back([this] { run(); });
+            }
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+
+    ~CompilerPool() {
+        stop();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_all();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void run() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait(lock, [this] {
+                    return stopping_ || !tasks_.empty();
+                });
+                if (stopping_ && tasks_.empty()) {
+                    return;
+                }
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<std::function<void()>> tasks_;
+    std::vector<std::thread> workers_;
+    bool stopping_ = false;
+};
+
+using CompiledImageFuture =
+    std::shared_future<CompiledKernelImage>;
+
+using LoadedKernel = std::variant<
+    std::unique_ptr<JITTPImpl<JITKernel>>,
+    std::unique_ptr<JITConvImpl<JITKernel>>>;
+
+// Shared compiled image and loaded launcher for one compute capability.
+struct ArchitectureKernel {
+    ArchitectureKernel(int architecture, CompiledImageFuture image)
+        : architecture(architecture), image(std::move(image)) {}
+
+    const int architecture;
+    CompiledImageFuture image;
+    // The context-less CUDA library is loaded once per compiled architecture.
+    // The image future also carries a compilation error to every operation
+    // sharing this entry.
+    std::mutex load_mutex;
+    std::unique_ptr<LoadedKernel> loaded;
+};
+
+int compute_capability(int32_t device_ordinal) {
+    // The FFI supplies the target ordinal. Do not infer it from the current
+    // CUDA device. Initialization may run outside the eventual launch context.
+    CUdevice device;
+    if (cuDeviceGet(&device, device_ordinal) != CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to resolve the CUDA device ordinal");
+    }
+    int major;
+    int minor;
+    if (cuDeviceGetAttribute(
+            &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) !=
+            CUDA_SUCCESS ||
+        cuDeviceGetAttribute(
+            &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) !=
+            CUDA_SUCCESS) {
+        throw std::runtime_error("Failed to query CUDA compute capability");
+    }
+    return major * 10 + minor;
+}
+
+#endif
+
+// Parsed plan and its compute-capability-specific CUDA artifacts.
+struct SharedKernel {
+    KernelFamily family;
+    ParsedKernel parsed;
+
+    SharedKernel(KernelFamily family, ParsedKernel parsed)
+        : family(family), parsed(std::move(parsed)) {}
+
+#ifdef CUDA_BACKEND
+    std::unique_ptr<LoadedKernel> make_loaded_kernel(
+        const CompiledKernelImage& image) const {
+        if (family == KernelFamily::kTensorProduct) {
+            return std::make_unique<LoadedKernel>(std::in_place_index<0>,
+                std::make_unique<JITTPImpl<JITKernel>>(
+                    image, parsed.forward_config, parsed.backward_config,
+                    parsed.double_backward_config, parsed.opt_level));
+        }
+        return std::make_unique<LoadedKernel>(std::in_place_index<1>,
+            std::make_unique<JITConvImpl<JITKernel>>(
+                image, parsed.forward_config, parsed.backward_config,
+                parsed.double_backward_config, parsed.opt_level));
+    }
+
+    ArchitectureKernel* schedule(int architecture) {
+        std::lock_guard<std::mutex> lock(compilation_mutex);
+        auto found = compilations.find(architecture);
+        if (found != compilations.end()) {
+            return found->second.get();
+        }
+
+        // Publish the future before queueing work so equivalent executables
+        // share both the in-flight compilation and a possible sticky error.
+        auto promise = std::make_shared<std::promise<CompiledKernelImage>>();
+        CompiledImageFuture compilation = promise->get_future().share();
+        auto compiled =
+            std::make_unique<ArchitectureKernel>(architecture, compilation);
+        ArchitectureKernel* result = compiled.get();
+        compilations.emplace(architecture, std::move(compiled));
+
+        // The worker produces only a context-independent CUDA image. Library
+        // loading and handle resolution remain on the execute path. CUkernel
+        // launch later selects JAX's context from its stream.
+        CompilerPool::instance().submit([this, architecture, promise] {
+            try {
+                const int major = architecture / 10;
+                const int minor = architecture % 10;
+                CompiledKernelImage image =
+                    family == KernelFamily::kTensorProduct
+                        ? JITTPImpl<JITKernel>::compile_image(
+                              parsed.source, major, minor, parsed.opt_level)
+                        : JITConvImpl<JITKernel>::compile_image(
+                              parsed.source, major, minor, parsed.opt_level);
+                promise->set_value(std::move(image));
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
         });
-    return {cached.first.get(), cached.second};
+        return result;
+    }
+
+    ArchitectureKernel* load(int architecture) {
+        ArchitectureKernel* compiled = schedule(architecture);
+        std::lock_guard<std::mutex> lock(compiled->load_mutex);
+        if (!compiled->loaded) {
+            // This is the cold-path wait. Once ready, the same loaded launcher
+            // is reused by all executable states for this compute capability.
+            const CompiledKernelImage& image = compiled->image.get();
+            compiled->loaded = make_loaded_kernel(image);
+        }
+        return compiled;
+    }
+
+    std::mutex compilation_mutex;
+    std::unordered_map<int, std::unique_ptr<ArchitectureKernel>> compilations;
+#endif
+};
+
+// One entry in a user-supplied-hash bucket. The payload remains here so the
+// interner can reject collisions rather than trusting the hash as identity.
+struct CachedKernel {
+    KernelFamily family;
+    std::string payload;
+    std::shared_ptr<SharedKernel> kernel;
+};
+
+std::mutex interner_mutex;
+std::unordered_map<int64_t, std::vector<CachedKernel>> kernel_interner;
+
+std::shared_ptr<SharedKernel> intern_kernel(
+    KernelFamily family, std::string_view payload, int64_t hash) {
+    std::lock_guard<std::mutex> lock(interner_mutex);
+    // `hash` is an interning bucket only. The complete payload and family are
+    // compared before sharing state. A hash collision cannot select a
+    // different kernel.
+    auto& bucket = kernel_interner[hash];
+    for (const CachedKernel& cached : bucket) {
+        if (cached.family == family && cached.payload == payload) {
+            return cached.kernel;
+        }
+    }
+
+    // Instantiation parses the static JSON once. XLA then owns a typed state
+    // referring to the immutable parsed description.
+    auto kernel = std::make_shared<SharedKernel>(
+        family, parse_kernel(payload, family));
+    bucket.push_back({family, std::string(payload), kernel});
+    return kernel;
 }
 
-std::pair<JITConvImpl<JITKernel>*, KernelProp> 
-    compile_conv_with_caching(std::string_view json_payload,
-                    int64_t hash,
-                    bool is_convolution) {
-    
-    auto &cached = find_or_compile_cached(
-        conv_cache, hash, [&] {
-            std::string err;
-            json root = json::parse(std::string(json_payload), err);
-            if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
+// XLA-owned handle into the process cache, with a warm target lookup.
+struct OeqExecutableState {
+    static ffi::TypeId id;
 
-            std::string kernel_src = root["kernel"].string_value();
-            auto forward_cfg = parse_json_config(root["forward_config"]);
-            auto backward_cfg = parse_json_config(root["backward_config"]);
-            auto dbackward_cfg = parse_json_config(root["double_backward_config"]);
-            auto kernel_prop_map = parse_json_config(root["kernel_prop"]);
+    explicit OeqExecutableState(std::shared_ptr<SharedKernel> kernel)
+        : kernel(std::move(kernel)) {}
 
-            auto jit_conv_impl = std::make_unique<JITConvImpl<JITKernel>>(
-                kernel_src,
-                forward_cfg,
-                backward_cfg,
-                dbackward_cfg,
-                kernel_prop_map);
-            return std::make_pair(std::move(jit_conv_impl),
-                                  KernelProp(kernel_prop_map, is_convolution));
-        });
-    return {cached.first.get(), cached.second};
+    std::shared_ptr<SharedKernel> kernel;
+
+#ifdef CUDA_BACKEND
+    static uint64_t target_key(int32_t device_ordinal, int architecture) {
+        return (static_cast<uint64_t>(
+                    static_cast<uint32_t>(device_ordinal)) << 32) |
+               static_cast<uint32_t>(architecture);
+    }
+
+    static int32_t target_device(uint64_t target) {
+        return static_cast<int32_t>(target >> 32);
+    }
+
+    static int target_architecture(uint64_t target) {
+        return static_cast<int32_t>(target);
+    }
+
+    void initialize(int32_t device_ordinal) {
+        // XLA may call initialization for every execution. The acquire/release
+        // pair makes the repeated-ordinal path a lock-free no-op after its
+        // compile has been enqueued.
+        const uint64_t current =
+            initialized_target.load(std::memory_order_acquire);
+        if (target_device(current) == device_ordinal) {
+            return;
+        }
+        const int architecture = compute_capability(device_ordinal);
+        // Initialization only enqueues host compilation. Execute waits only if
+        // the image is still cold.
+        kernel->schedule(architecture);
+        initialized_target.store(
+            target_key(device_ordinal, architecture),
+            std::memory_order_release);
+    }
+
+    ArchitectureKernel* load(int32_t device_ordinal) {
+        const uint64_t current =
+            initialized_target.load(std::memory_order_acquire);
+        const int architecture = target_device(current) == device_ordinal
+            ? target_architecture(current)
+            : compute_capability(device_ordinal);
+        ArchitectureKernel* recent =
+            recent_kernel.load(std::memory_order_acquire);
+        // The architecture is immutable, so one published pointer is a
+        // race-free warm cache even when devices execute concurrently.
+        if (recent != nullptr && recent->architecture == architecture) {
+            return recent;
+        }
+        ArchitectureKernel* loaded = kernel->load(architecture);
+        recent_kernel.store(loaded, std::memory_order_release);
+        return loaded;
+    }
+
+    std::atomic<uint64_t> initialized_target{UINT64_MAX};
+    std::atomic<ArchitectureKernel*> recent_kernel{nullptr};
+#else
+    void initialize(int32_t) {
+        std::lock_guard<std::mutex> lock(load_mutex);
+        if (tensor_product || convolution) {
+            return;
+        }
+        const ParsedKernel& parsed = kernel->parsed;
+        if (kernel->family == KernelFamily::kTensorProduct) {
+            tensor_product = std::make_unique<JITTPImpl<JITKernel>>(
+                parsed.source, parsed.forward_config, parsed.backward_config,
+                parsed.double_backward_config, parsed.opt_level);
+        } else {
+            convolution = std::make_unique<JITConvImpl<JITKernel>>(
+                parsed.source, parsed.forward_config, parsed.backward_config,
+                parsed.double_backward_config, parsed.opt_level);
+        }
+    }
+
+    std::mutex load_mutex;
+    std::unique_ptr<JITTPImpl<JITKernel>> tensor_product;
+    std::unique_ptr<JITConvImpl<JITKernel>> convolution;
+#endif
+};
+
+ffi::TypeId OeqExecutableState::id = {};
+constexpr ffi::TypeInfo kOeqExecutableStateTypeInfo =
+    ffi::MakeTypeInfo<OeqExecutableState>();
+
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>> instantiate_kernel(
+    KernelFamily family, std::string_view payload, int64_t hash) {
+    try {
+        // XLA owns the lightweight executable state. The process cache shares
+        // parsed plans and compiled artifacts.
+        return std::make_unique<OeqExecutableState>(
+            intern_kernel(family, payload, hash));
+    } catch (const std::exception& error) {
+        return ffi::Unexpected(ffi::Error::InvalidArgument(error.what()));
+    }
 }
+
+// Family-specific launcher plus validated static dimensions.
+using TensorProductKernel =
+    std::pair<JITTPImpl<JITKernel>*, const KernelProp*>;
+using ConvolutionKernel =
+    std::pair<JITConvImpl<JITKernel>*, const KernelProp*>;
+
+ffi::ErrorOr<TensorProductKernel> tensor_product_kernel(
+    OeqExecutableState* state, int32_t device_ordinal) {
+    try {
+#ifdef CUDA_BACKEND
+        ArchitectureKernel* compiled = state->load(device_ordinal);
+        LoadedKernel& loaded = *compiled->loaded;
+        return TensorProductKernel{
+            std::get<std::unique_ptr<JITTPImpl<JITKernel>>>(loaded).get(),
+            &state->kernel->parsed.properties};
+#else
+        state->initialize(device_ordinal);
+        return TensorProductKernel{
+            state->tensor_product.get(), &state->kernel->parsed.properties};
+#endif
+    } catch (const std::exception& error) {
+        // `future::get()` rethrows NVRTC failures here. Convert them to the
+        // FFI error channel instead of allowing an exception through XLA.
+        return ffi::Unexpected(ffi::Error::Internal(error.what()));
+    }
+}
+
+ffi::ErrorOr<ConvolutionKernel> convolution_kernel(
+    OeqExecutableState* state, int32_t device_ordinal) {
+    try {
+#ifdef CUDA_BACKEND
+        ArchitectureKernel* compiled = state->load(device_ordinal);
+        LoadedKernel& loaded = *compiled->loaded;
+        return ConvolutionKernel{
+            std::get<std::unique_ptr<JITConvImpl<JITKernel>>>(loaded).get(),
+            &state->kernel->parsed.properties};
+#else
+        state->initialize(device_ordinal);
+        return ConvolutionKernel{
+            state->convolution.get(), &state->kernel->parsed.properties};
+#endif
+    } catch (const std::exception& error) {
+        // Compilation errors are shared by all users of the future and
+        // reported through the FFI boundary.
+        return ffi::Unexpected(ffi::Error::Internal(error.what()));
+    }
+}
+
+}  // namespace
 
 inline void check_tensor(const ffi::AnyBuffer &buffer, 
                             std::initializer_list<int64_t> expected_shape,
@@ -292,11 +661,16 @@ ffi::Error tp_forward_impl(
         ffi::AnyBuffer W,
         ffi::Result<ffi::AnyBuffer> L3_out,
         stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-   
-    auto [jit_kernel, k] = compile_tp_with_caching(
-        kernel_json, hash, false);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = tensor_product_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const KernelProp& k = *properties;
     const int64_t num_batch = L1_in.dimensions()[0];
 
     check_tensor(L1_in, {num_batch, k.L1_dim}, k.irrep_dtype, "L1_in");
@@ -326,12 +700,17 @@ ffi::Error tp_backward_impl(
         ffi::Result<ffi::AnyBuffer> L1_grad,
         ffi::Result<ffi::AnyBuffer> L2_grad,
         ffi::Result<ffi::AnyBuffer> W_grad, 
-        stream_t stream, 
+        stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_tp_with_caching(
-        kernel_json, hash, false);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = tensor_product_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const KernelProp& k = *properties;
     const int64_t num_batch = L1_in.dimensions()[0];
     check_tensor(L1_in, {num_batch, k.L1_dim}, k.irrep_dtype, "L1_in");
     check_tensor(L2_in, {num_batch, k.L2_dim}, k.irrep_dtype, "L2_in");
@@ -376,12 +755,17 @@ ffi::Error tp_double_backward_impl(
         ffi::Result<ffi::AnyBuffer> L2_grad,
         ffi::Result<ffi::AnyBuffer> W_grad,
         ffi::Result<ffi::AnyBuffer> L3_dgrad,
-        stream_t stream, 
+        stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_tp_with_caching(
-        kernel_json, hash, false);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = tensor_product_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const KernelProp& k = *properties;
     const int64_t num_batch = L1_in.dimensions()[0];
     check_tensor(L1_in, {num_batch, k.L1_dim}, k.irrep_dtype, "L1_in");
     check_tensor(L2_in, {num_batch, k.L2_dim}, k.irrep_dtype, "L2_in");
@@ -427,6 +811,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});  // cudaGraph enabled
@@ -442,6 +828,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
@@ -461,6 +849,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
@@ -475,12 +865,17 @@ ffi::Error conv_forward_impl(
         ffi::AnyBuffer workspace,
         ffi::AnyBuffer transpose_perm,
         ffi::Result<ffi::AnyBuffer> L3_out,
-        stream_t stream, 
+        stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-   
-    auto [jit_kernel, k] = compile_conv_with_caching(
-        kernel_json, hash, true);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = convolution_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const KernelProp& k = *properties;
     const int64_t nnz = rows.dimensions()[0];
     const int64_t node_count = L1_in.dimensions()[0];
     void* workspace_ptr = data_ptr(workspace);
@@ -530,12 +925,17 @@ ffi::Error conv_backward_impl(
         ffi::AnyBuffer cols,
         ffi::AnyBuffer workspace,
         ffi::AnyBuffer transpose_perm,
-        stream_t stream, 
+        stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_conv_with_caching(
-        kernel_json, hash, true);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = convolution_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const KernelProp& k = *properties;
     const int64_t nnz = rows.dimensions()[0];
     const int64_t node_count = L1_in.dimensions()[0];
     void* workspace_ptr = data_ptr(workspace);
@@ -599,12 +999,17 @@ ffi::Error conv_double_backward_impl(
         ffi::AnyBuffer cols,
         ffi::AnyBuffer workspace,
         ffi::AnyBuffer transpose_perm,
-        stream_t stream, 
+        stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_conv_with_caching(
-        kernel_json, hash, true);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = convolution_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const KernelProp& k = *properties;
     const int64_t nnz = rows.dimensions()[0];
     const int64_t node_count = L1_in.dimensions()[0];
     void* workspace_ptr = data_ptr(workspace);
@@ -667,31 +1072,56 @@ bool is_hip() {
 }
 
 // --------------------- FFI Bindings --------------------------
+// Instantiation interns static state. Initialization queues NVRTC work.
+// Execution loads a cold image if needed and launches it.
 
-ffi::Error tp_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
-    compile_tp_with_caching(kernel_json, hash, false);
-    return ffi::Error::Success();
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>> tp_instantiate_impl(
+    std::string_view kernel_json, int64_t hash) {
+    return instantiate_kernel(KernelFamily::kTensorProduct, kernel_json, hash);
 }
 
-ffi::Error conv_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
-    compile_conv_with_caching(kernel_json, hash, true);
-    return ffi::Error::Success();
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>> conv_instantiate_impl(
+    std::string_view kernel_json, int64_t hash) {
+    return instantiate_kernel(KernelFamily::kConvolution, kernel_json, hash);
 }
 
-#define OEQ_STOCK_INITIALIZE_ATTRIBUTES                                                \
-    .Ctx<ffi::PlatformStream<stream_t>>()                                              \
-        .Attr<std::string_view>("kernel")                                              \
+ffi::Error initialize_impl(
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view, int64_t) {
+    try {
+        state->initialize(device_ordinal);
+        return ffi::Error::Success();
+    } catch (const std::exception& error) {
+        return ffi::Error::Internal(error.what());
+    }
+}
+
+#define OEQ_KERNEL_ATTRIBUTES                                                         \
+    .Attr<std::string_view>("kernel")                                                \
         .Attr<int64_t>("hash")
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    tp_initialize, tp_initialize_impl,
-    ffi::Ffi::BindInitialize() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+    tp_instantiate, tp_instantiate_impl,
+    ffi::Ffi::BindInstantiate() OEQ_KERNEL_ATTRIBUTES);
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    conv_initialize, conv_initialize_impl,
-    ffi::Ffi::BindInitialize() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+    conv_instantiate, conv_instantiate_impl,
+    ffi::Ffi::BindInstantiate() OEQ_KERNEL_ATTRIBUTES);
 
-#undef OEQ_STOCK_INITIALIZE_ATTRIBUTES
+#define OEQ_INITIALIZE_BINDING                                                        \
+    ffi::Ffi::BindInitialize()                                                       \
+        .Ctx<ffi::State<OeqExecutableState>>()                                       \
+        .Ctx<ffi::DeviceOrdinal>()                                                   \
+        OEQ_KERNEL_ATTRIBUTES
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tp_initialize, initialize_impl, OEQ_INITIALIZE_BINDING);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    conv_initialize, initialize_impl, OEQ_INITIALIZE_BINDING);
+
+#undef OEQ_INITIALIZE_BINDING
+#undef OEQ_KERNEL_ATTRIBUTES
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     conv_forward, conv_forward_impl,
@@ -705,6 +1135,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
@@ -724,6 +1156,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
@@ -747,28 +1181,40 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
 namespace {
 
-#define OEQ_FFI_HANDLER(NAME, INITIALIZE)                                             \
-    {#NAME, reinterpret_cast<void*>(INITIALIZE), reinterpret_cast<void*>(NAME)}
+#define OEQ_FFI_HANDLER(NAME, INSTANTIATE, INITIALIZE)                                \
+    {#NAME, reinterpret_cast<void*>(INSTANTIATE),                                    \
+     reinterpret_cast<void*>(INITIALIZE), reinterpret_cast<void*>(NAME)}
 
 const OeqFfiHandler kFfiHandlers[] = {
-    OEQ_FFI_HANDLER(tp_forward, tp_initialize),
-    OEQ_FFI_HANDLER(tp_backward, tp_initialize),
-    OEQ_FFI_HANDLER(tp_double_backward, tp_initialize),
-    OEQ_FFI_HANDLER(conv_forward, conv_initialize),
-    OEQ_FFI_HANDLER(conv_backward, conv_initialize),
-    OEQ_FFI_HANDLER(conv_double_backward, conv_initialize),
+    OEQ_FFI_HANDLER(tp_forward, tp_instantiate, tp_initialize),
+    OEQ_FFI_HANDLER(tp_backward, tp_instantiate, tp_initialize),
+    OEQ_FFI_HANDLER(tp_double_backward, tp_instantiate, tp_initialize),
+    OEQ_FFI_HANDLER(conv_forward, conv_instantiate, conv_initialize),
+    OEQ_FFI_HANDLER(conv_backward, conv_instantiate, conv_initialize),
+    OEQ_FFI_HANDLER(
+        conv_double_backward, conv_instantiate, conv_initialize),
 };
 
 #undef OEQ_FFI_HANDLER
 
+const OeqFfiType kFfiTypes[] = {{
+    "oeq_executable_state",
+    &OeqExecutableState::id,
+    &kOeqExecutableStateTypeInfo,
+}};
+
 const OeqFfiHandlerTable kFfiHandlerTable = {
     OEQ_FFI_ABI_VERSION,
+    sizeof(kFfiTypes) / sizeof(kFfiTypes[0]),
+    kFfiTypes,
     sizeof(kFfiHandlers) / sizeof(kFfiHandlers[0]),
     kFfiHandlers,
 };
@@ -782,12 +1228,26 @@ extern "C" const OeqFfiHandlerTable* oeq_ffi_handler_table() {
 // --------------------- NB Module --------------------------
 #ifndef OEQ_NO_PYTHON_MODULE
 NB_MODULE(openequivariance_extjax, m) {
+    m.def("type_registrations", []() {
+        nb::dict registrations;
+        const auto* table = oeq_ffi_handler_table();
+        for (uint32_t index = 0; index < table->type_count; ++index) {
+            const auto& type = table->types[index];
+            nb::dict registration;
+            registration["type_id"] = nb::capsule(type.type_id);
+            registration["type_info"] = nb::capsule(
+                const_cast<void*>(type.type_info));
+            registrations[type.name] = registration;
+        }
+        return registrations;
+    });
     m.def("registrations", []() {
         nb::dict registrations;
         const auto* handlers = oeq_ffi_handler_table();
         for (uint32_t index = 0; index < handlers->handler_count; ++index) {
             const auto& handler = handlers->handlers[index];
             nb::dict stages;
+            stages["instantiate"] = nb::capsule(handler.instantiate);
             stages["initialize"] = nb::capsule(handler.initialize);
             stages["execute"] = nb::capsule(handler.execute);
             registrations[handler.name] = stages;

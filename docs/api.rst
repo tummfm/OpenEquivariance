@@ -47,6 +47,11 @@ you need to set ``OEQ_NOTORCH=1`` in your local environment (within Python,
 ``os.environ["OEQ_NOTORCH"] = 1``). For the moment, we require this to avoid 
 breaking the PyTorch version of OpenEquivariance.
 
+Independent JAX kernels are compiled by a bounded pool of 16 workers. Set
+``OEQ_JAX_COMPILER_THREADS`` to an integer from 1 to 64 before the first kernel
+is initialized to change this bound. Lower values reduce peak compiler CPU and
+memory use. Higher values allow more independent NVRTC compilations to overlap.
+
 
 .. autoclass:: openequivariance.jax.TensorProduct
     :members: forward, reorder_weights_from_e3nn, reorder_weights_to_e3nn
