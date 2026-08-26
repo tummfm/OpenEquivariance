@@ -49,6 +49,8 @@ using json = json11::Json;
 
 #include "tensorproducts.hpp"
 #include "convolution.hpp"
+#include "factorized_projected.hpp"
+#include "symmetric_literal.hpp"
 
 xla::ffi::DataType enum_to_xla_dtype(int64_t i){
     switch(i) {
@@ -150,15 +152,15 @@ std::unordered_map<std::string, int64_t> parse_json_config(const json &j_obj) {
 }
 
 struct KernelProp {
-    int64_t L1_dim, L2_dim, L3_dim, weight_numel;
-    bool shared_weights;
-    xla::ffi::DataType irrep_dtype;
-    xla::ffi::DataType weight_dtype;
+    int64_t L1_dim = 0, L2_dim = 0, L3_dim = 0, weight_numel = 0;
+    bool shared_weights = false;
+    xla::ffi::DataType irrep_dtype = xla::ffi::DataType::INVALID;
+    xla::ffi::DataType weight_dtype = xla::ffi::DataType::INVALID;
 
-    int64_t workspace_size;     // Convolution only
-    bool deterministic;
-    xla::ffi::DataType idx_dtype;
-    xla::ffi::DataType workspace_dtype;
+    int64_t workspace_size = 0;     // Convolution only
+    bool deterministic = false;
+    xla::ffi::DataType idx_dtype = xla::ffi::DataType::INVALID;
+    xla::ffi::DataType workspace_dtype = xla::ffi::DataType::INVALID;
 
     KernelProp() {}
 
@@ -184,7 +186,12 @@ struct KernelProp {
 namespace {
 
 // Selects the dense tensor-product or sparse-convolution payload layout.
-enum class KernelFamily { kTensorProduct, kConvolution };
+enum class KernelFamily {
+    kTensorProduct,
+    kConvolution,
+    kFactorizedProjected,
+    kSymmetricLiteral,
+};
 
 // Static JSON decoded and validated once at instantiation. It contains all
 // source and launch data needed to create a device-specific launcher later.
@@ -204,6 +211,11 @@ KernelLaunchConfig parse_launch_config(const json& config) {
 }
 
 ParsedKernel parse_kernel(std::string_view payload, KernelFamily family) {
+    if (family == KernelFamily::kFactorizedProjected ||
+        family == KernelFamily::kSymmetricLiteral) {
+        return {std::string(payload), {}, {}, {}, {}, 3};
+    }
+
     std::string error;
     json root = json::parse(std::string(payload), error);
     if (!error.empty()) {
@@ -321,7 +333,9 @@ using CompiledImageFuture =
 
 using LoadedKernel = std::variant<
     std::unique_ptr<JITTPImpl<JITKernel>>,
-    std::unique_ptr<JITConvImpl<JITKernel>>>;
+    std::unique_ptr<JITConvImpl<JITKernel>>,
+    std::unique_ptr<JITFactorizedProjectedImpl<JITKernel>>,
+    std::unique_ptr<JITSymmetricLiteralImpl<JITKernel>>>;
 
 // Shared compiled image and loaded launcher for one compute capability.
 struct ArchitectureKernel {
@@ -370,16 +384,25 @@ struct SharedKernel {
 #ifdef CUDA_BACKEND
     std::unique_ptr<LoadedKernel> make_loaded_kernel(
         const CompiledKernelImage& image) const {
-        if (family == KernelFamily::kTensorProduct) {
-            return std::make_unique<LoadedKernel>(std::in_place_index<0>,
-                std::make_unique<JITTPImpl<JITKernel>>(
-                    image, parsed.forward_config, parsed.backward_config,
-                    parsed.double_backward_config, parsed.opt_level));
+        switch (family) {
+            case KernelFamily::kTensorProduct:
+                return std::make_unique<LoadedKernel>(std::in_place_index<0>,
+                    std::make_unique<JITTPImpl<JITKernel>>(
+                        image, parsed.forward_config, parsed.backward_config,
+                        parsed.double_backward_config, parsed.opt_level));
+            case KernelFamily::kConvolution:
+                return std::make_unique<LoadedKernel>(std::in_place_index<1>,
+                    std::make_unique<JITConvImpl<JITKernel>>(
+                        image, parsed.forward_config, parsed.backward_config,
+                        parsed.double_backward_config, parsed.opt_level));
+            case KernelFamily::kFactorizedProjected:
+                return std::make_unique<LoadedKernel>(std::in_place_index<2>,
+                    std::make_unique<JITFactorizedProjectedImpl<JITKernel>>(image));
+            case KernelFamily::kSymmetricLiteral:
+                return std::make_unique<LoadedKernel>(std::in_place_index<3>,
+                    std::make_unique<JITSymmetricLiteralImpl<JITKernel>>(image));
         }
-        return std::make_unique<LoadedKernel>(std::in_place_index<1>,
-            std::make_unique<JITConvImpl<JITKernel>>(
-                image, parsed.forward_config, parsed.backward_config,
-                parsed.double_backward_config, parsed.opt_level));
+        throw std::logic_error("unknown kernel family");
     }
 
     ArchitectureKernel* schedule(int architecture) {
@@ -405,12 +428,23 @@ struct SharedKernel {
             try {
                 const int major = architecture / 10;
                 const int minor = architecture % 10;
-                CompiledKernelImage image =
-                    family == KernelFamily::kTensorProduct
-                        ? JITTPImpl<JITKernel>::compile_image(
-                              parsed.source, major, minor, parsed.opt_level)
-                        : JITConvImpl<JITKernel>::compile_image(
-                              parsed.source, major, minor, parsed.opt_level);
+                CompiledKernelImage image = [&] {
+                    switch (family) {
+                        case KernelFamily::kTensorProduct:
+                            return JITTPImpl<JITKernel>::compile_image(
+                                parsed.source, major, minor, parsed.opt_level);
+                        case KernelFamily::kConvolution:
+                            return JITConvImpl<JITKernel>::compile_image(
+                                parsed.source, major, minor, parsed.opt_level);
+                        case KernelFamily::kFactorizedProjected:
+                            return JITFactorizedProjectedImpl<JITKernel>::compile_image(
+                                parsed.source, major, minor);
+                        case KernelFamily::kSymmetricLiteral:
+                            return JITSymmetricLiteralImpl<JITKernel>::compile_image(
+                                parsed.source, major, minor);
+                    }
+                    throw std::logic_error("unknown kernel family");
+                }();
                 promise->set_value(std::move(image));
             } catch (...) {
                 promise->set_exception(std::current_exception());
@@ -533,24 +567,40 @@ struct OeqExecutableState {
 #else
     void initialize(int32_t) {
         std::lock_guard<std::mutex> lock(load_mutex);
-        if (tensor_product || convolution) {
+        if (tensor_product || convolution || factorized_projected ||
+            symmetric_literal) {
             return;
         }
         const ParsedKernel& parsed = kernel->parsed;
-        if (kernel->family == KernelFamily::kTensorProduct) {
-            tensor_product = std::make_unique<JITTPImpl<JITKernel>>(
-                parsed.source, parsed.forward_config, parsed.backward_config,
-                parsed.double_backward_config, parsed.opt_level);
-        } else {
-            convolution = std::make_unique<JITConvImpl<JITKernel>>(
-                parsed.source, parsed.forward_config, parsed.backward_config,
-                parsed.double_backward_config, parsed.opt_level);
+        switch (kernel->family) {
+            case KernelFamily::kTensorProduct:
+                tensor_product = std::make_unique<JITTPImpl<JITKernel>>(
+                    parsed.source, parsed.forward_config, parsed.backward_config,
+                    parsed.double_backward_config, parsed.opt_level);
+                break;
+            case KernelFamily::kConvolution:
+                convolution = std::make_unique<JITConvImpl<JITKernel>>(
+                    parsed.source, parsed.forward_config, parsed.backward_config,
+                    parsed.double_backward_config, parsed.opt_level);
+                break;
+            case KernelFamily::kFactorizedProjected:
+                factorized_projected =
+                    std::make_unique<JITFactorizedProjectedImpl<JITKernel>>(
+                        parsed.source);
+                break;
+            case KernelFamily::kSymmetricLiteral:
+                symmetric_literal =
+                    std::make_unique<JITSymmetricLiteralImpl<JITKernel>>(
+                        parsed.source);
+                break;
         }
     }
 
     std::mutex load_mutex;
     std::unique_ptr<JITTPImpl<JITKernel>> tensor_product;
     std::unique_ptr<JITConvImpl<JITKernel>> convolution;
+    std::unique_ptr<JITFactorizedProjectedImpl<JITKernel>> factorized_projected;
+    std::unique_ptr<JITSymmetricLiteralImpl<JITKernel>> symmetric_literal;
 #endif
 };
 
@@ -618,6 +668,39 @@ ffi::ErrorOr<ConvolutionKernel> convolution_kernel(
     }
 }
 
+ffi::ErrorOr<JITFactorizedProjectedImpl<JITKernel>*>
+factorized_projected_kernel(
+    OeqExecutableState* state, int32_t device_ordinal) {
+    try {
+#ifdef CUDA_BACKEND
+        LoadedKernel& loaded = *state->load(device_ordinal)->loaded;
+        return std::get<
+            std::unique_ptr<JITFactorizedProjectedImpl<JITKernel>>>(loaded).get();
+#else
+        state->initialize(device_ordinal);
+        return state->factorized_projected.get();
+#endif
+    } catch (const std::exception& error) {
+        return ffi::Unexpected(ffi::Error::Internal(error.what()));
+    }
+}
+
+ffi::ErrorOr<JITSymmetricLiteralImpl<JITKernel>*> symmetric_literal_kernel(
+    OeqExecutableState* state, int32_t device_ordinal) {
+    try {
+#ifdef CUDA_BACKEND
+        LoadedKernel& loaded = *state->load(device_ordinal)->loaded;
+        return std::get<
+            std::unique_ptr<JITSymmetricLiteralImpl<JITKernel>>>(loaded).get();
+#else
+        state->initialize(device_ordinal);
+        return state->symmetric_literal.get();
+#endif
+    } catch (const std::exception& error) {
+        return ffi::Unexpected(ffi::Error::Internal(error.what()));
+    }
+}
+
 }  // namespace
 
 inline void check_tensor(const ffi::AnyBuffer &buffer, 
@@ -652,6 +735,18 @@ inline void check_tensor(const ffi::AnyBuffer &buffer,
             ". Expected datatype " + xla_dtype_to_string(expected_dtype) + 
             ", got " + xla_dtype_to_string(buffer.element_type()));
     }
+}
+
+// JAX lowers an inactive tangent to a rank-zero buffer.  Generated JVP kernels
+// render these operands as scalar_t(0), so their data pointer is never read.
+inline void check_tensor_or_scalar_placeholder(
+    const ffi::AnyBuffer &buffer, std::initializer_list<int64_t> expected_shape,
+    xla::ffi::DataType expected_dtype, std::string tensor_name) {
+    if (buffer.dimensions().size() == 0) {
+        check_tensor(buffer, {}, expected_dtype, std::move(tensor_name));
+        return;
+    }
+    check_tensor(buffer, expected_shape, expected_dtype, std::move(tensor_name));
 }
 
 // --------------------- Tensor Products --------------------------
@@ -1187,7 +1282,620 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
-namespace {
+// ------------------- Generated factorized convolution -------------------
+void validate_projected_inputs(ffi::AnyBuffer &x, ffi::AnyBuffer &sh,
+                               ffi::AnyBuffer &senders, int64_t input_dim,
+                               int64_t edge_dim) {
+    if (x.dimensions().size() != 2 || sh.dimensions().size() != 2) {
+        throw std::logic_error("projected factorized inputs must have rank two");
+    }
+    if (x.element_type() != xla::ffi::DataType::F32 &&
+        x.element_type() != xla::ffi::DataType::F64) {
+        throw std::logic_error("projected factorized kernels support only f32 and f64");
+    }
+    const int64_t edges = sh.dimensions()[0];
+    check_tensor(x, {x.dimensions()[0], input_dim}, x.element_type(), "x");
+    check_tensor(sh, {edges, edge_dim}, x.element_type(), "sh");
+    check_tensor(senders, {edges}, xla::ffi::DataType::S32, "senders");
+}
+
+ffi::Error factorized_projected_forward_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer sh, ffi::AnyBuffer weights, ffi::AnyBuffer senders,
+    ffi::AnyBuffer row_ptr, ffi::Result<ffi::AnyBuffer> out, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels,
+    int64_t input_dim, int64_t edge_dim, int64_t weight_dim, int64_t output_dim) {
+    validate_projected_inputs(x, sh, senders, input_dim, edge_dim);
+    const int64_t nodes = x.dimensions()[0], edges = sh.dimensions()[0];
+    check_tensor(weights, {edges, weight_dim}, x.element_type(), "weights");
+    check_tensor(row_ptr, {nodes + 1}, xla::ffi::DataType::S32, "row_ptr");
+    check_tensor(*out, {nodes, output_dim}, x.element_type(), "out");
+    auto loaded = factorized_projected_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->forward(
+        nodes, edges, channels, data_ptr(x), data_ptr(sh), data_ptr(weights),
+        data_ptr(senders), data_ptr(row_ptr), data_ptr(out), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error factorized_projected_forward_jvp_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer sh, ffi::AnyBuffer weights, ffi::AnyBuffer senders,
+    ffi::AnyBuffer row_ptr, ffi::AnyBuffer tx, ffi::AnyBuffer tsh,
+    ffi::AnyBuffer tweights, ffi::Result<ffi::AnyBuffer> out, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels,
+    int64_t input_dim, int64_t edge_dim, int64_t weight_dim, int64_t output_dim) {
+    validate_projected_inputs(x, sh, senders, input_dim, edge_dim);
+    const int64_t nodes = x.dimensions()[0], edges = sh.dimensions()[0];
+    check_tensor(weights, {edges, weight_dim}, x.element_type(), "weights");
+    check_tensor(row_ptr, {nodes + 1}, xla::ffi::DataType::S32, "row_ptr");
+    check_tensor_or_scalar_placeholder(
+        tx, {nodes, input_dim}, x.element_type(), "tx");
+    check_tensor_or_scalar_placeholder(
+        tsh, {edges, edge_dim}, x.element_type(), "tsh");
+    check_tensor_or_scalar_placeholder(
+        tweights, {edges, weight_dim}, x.element_type(), "tweights");
+    check_tensor(*out, {nodes, output_dim}, x.element_type(), "out");
+    auto loaded = factorized_projected_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->forward_jvp(
+        nodes, edges, channels, data_ptr(x), data_ptr(sh), data_ptr(weights),
+        data_ptr(senders), data_ptr(row_ptr), data_ptr(tx), data_ptr(tsh),
+        data_ptr(tweights), data_ptr(out), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error factorized_projected_backward_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer sh, ffi::AnyBuffer weights, ffi::AnyBuffer senders,
+    ffi::AnyBuffer receivers, ffi::AnyBuffer dout, ffi::Result<ffi::AnyBuffer> dx,
+    ffi::Result<ffi::AnyBuffer> dsh, ffi::Result<ffi::AnyBuffer> dweights,
+    stream_t stream, OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash,
+    int64_t channels, int64_t input_dim, int64_t edge_dim, int64_t weight_dim,
+    int64_t output_dim) {
+    validate_projected_inputs(x, sh, senders, input_dim, edge_dim);
+    const int64_t nodes = x.dimensions()[0], edges = sh.dimensions()[0];
+    check_tensor(weights, {edges, weight_dim}, x.element_type(), "weights");
+    check_tensor(receivers, {edges}, xla::ffi::DataType::S32, "receivers");
+    check_tensor(dout, {nodes, output_dim}, x.element_type(), "dout");
+    check_tensor(*dx, {nodes, input_dim}, x.element_type(), "dx");
+    check_tensor(*dsh, {edges, edge_dim}, x.element_type(), "dsh");
+    check_tensor(*dweights, {edges, weight_dim}, x.element_type(), "dweights");
+    zero_buffer(*dx, stream);
+    zero_buffer(*dsh, stream);
+    zero_buffer(*dweights, stream);
+    auto loaded = factorized_projected_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->spatial_backward(
+        nodes, edges, data_ptr(x), data_ptr(sh), data_ptr(weights), data_ptr(senders),
+        data_ptr(receivers), data_ptr(dout), data_ptr(dx), data_ptr(dsh),
+        data_ptr(dweights), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error factorized_projected_weight_backward_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer sh, ffi::AnyBuffer senders,
+    ffi::AnyBuffer receivers, ffi::AnyBuffer dout, ffi::Result<ffi::AnyBuffer> dweights,
+    stream_t stream, OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash,
+    int64_t channels, int64_t input_dim, int64_t edge_dim, int64_t weight_dim,
+    int64_t output_dim) {
+    validate_projected_inputs(x, sh, senders, input_dim, edge_dim);
+    const int64_t nodes = x.dimensions()[0], edges = sh.dimensions()[0];
+    check_tensor(receivers, {edges}, xla::ffi::DataType::S32, "receivers");
+    check_tensor(dout, {nodes, output_dim}, x.element_type(), "dout");
+    check_tensor(*dweights, {edges, weight_dim}, x.element_type(), "dweights");
+    zero_buffer(*dweights, stream);
+    auto loaded = factorized_projected_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->weight_backward(
+        nodes, edges, channels, data_ptr(x), data_ptr(sh), data_ptr(senders),
+        data_ptr(receivers), data_ptr(dout), data_ptr(dweights), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error factorized_projected_backward_jvp_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer sh, ffi::AnyBuffer weights, ffi::AnyBuffer senders,
+    ffi::AnyBuffer receivers, ffi::AnyBuffer dout, ffi::AnyBuffer tx,
+    ffi::AnyBuffer tsh, ffi::AnyBuffer tweights, ffi::AnyBuffer tdout,
+    ffi::Result<ffi::AnyBuffer> tdx, ffi::Result<ffi::AnyBuffer> tdsh,
+    ffi::Result<ffi::AnyBuffer> tdweights, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels, int64_t input_dim,
+    int64_t edge_dim, int64_t weight_dim, int64_t output_dim) {
+    validate_projected_inputs(x, sh, senders, input_dim, edge_dim);
+    const int64_t nodes = x.dimensions()[0], edges = sh.dimensions()[0];
+    check_tensor(weights, {edges, weight_dim}, x.element_type(), "weights");
+    check_tensor(receivers, {edges}, xla::ffi::DataType::S32, "receivers");
+    check_tensor(dout, {nodes, output_dim}, x.element_type(), "dout");
+    check_tensor_or_scalar_placeholder(
+        tx, {nodes, input_dim}, x.element_type(), "tx");
+    check_tensor_or_scalar_placeholder(
+        tsh, {edges, edge_dim}, x.element_type(), "tsh");
+    check_tensor_or_scalar_placeholder(
+        tweights, {edges, weight_dim}, x.element_type(), "tweights");
+    check_tensor_or_scalar_placeholder(
+        tdout, {nodes, output_dim}, x.element_type(), "tdout");
+    check_tensor(*tdx, {nodes, input_dim}, x.element_type(), "tdx");
+    check_tensor(*tdsh, {edges, edge_dim}, x.element_type(), "tdsh");
+    check_tensor(*tdweights, {edges, weight_dim}, x.element_type(), "tdweights");
+    zero_buffer(*tdx, stream);
+    zero_buffer(*tdsh, stream);
+    zero_buffer(*tdweights, stream);
+    auto loaded = factorized_projected_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->spatial_backward_jvp(
+        nodes, edges, data_ptr(x), data_ptr(sh), data_ptr(weights), data_ptr(senders),
+        data_ptr(receivers), data_ptr(dout), data_ptr(tx), data_ptr(tsh),
+        data_ptr(tweights), data_ptr(tdout), data_ptr(tdx), data_ptr(tdsh),
+        data_ptr(tdweights), stream);
+    return ffi::Error::Success();
+}
+
+// ------------------- Generated symmetric contractions -------------------
+
+void validate_symmetric_inputs(const ffi::AnyBuffer &x, const ffi::AnyBuffer &selector,
+                               const ffi::AnyBuffer &weights,
+                               int64_t channels, int64_t feature_dim,
+                               int64_t feature_layout, int64_t weight_dim) {
+    if (x.dimensions().size() != 3) {
+        throw std::logic_error("symmetric x must have rank 3");
+    }
+    const int64_t nodes = x.dimensions()[0];
+    const auto dtype = x.element_type();
+    if (dtype != xla::ffi::DataType::F32 && dtype != xla::ffi::DataType::F64) {
+        throw std::logic_error("symmetric contraction supports only f32 and f64");
+    }
+    if (feature_layout == 0) {
+        check_tensor(x, {nodes, channels, feature_dim}, dtype, "symmetric x");
+    } else if (feature_layout == 1) {
+        check_tensor(x, {nodes, feature_dim, channels}, dtype, "symmetric x");
+    } else {
+        throw std::logic_error("invalid symmetric feature layout");
+    }
+    if (weights.dimensions().size() != 2 || weights.dimensions()[1] != weight_dim ||
+        weights.element_type() != dtype) {
+        throw std::logic_error(
+            "symmetric weights must have shape [S,weight_dim] and match x dtype");
+    }
+    const int64_t num_elements = weights.dimensions()[0];
+    if (num_elements <= 0) {
+        throw std::logic_error("symmetric weights require a nonempty species table");
+    }
+    check_tensor(selector, {nodes}, xla::ffi::DataType::S32, "symmetric species");
+}
+
+void validate_symmetric_feature_buffer(const ffi::AnyBuffer &value,
+                                       const ffi::AnyBuffer &x, std::string_view name) {
+    const auto value_dimensions = value.dimensions();
+    const auto x_dimensions = x.dimensions();
+    bool dimensions_match = value_dimensions.size() == x_dimensions.size();
+    for (size_t index = 0; dimensions_match && index < x_dimensions.size(); ++index) {
+        dimensions_match = value_dimensions[index] == x_dimensions[index];
+    }
+    if (!dimensions_match || value.element_type() != x.element_type()) {
+        throw std::logic_error(std::string(name) +
+                               " must match symmetric x shape and dtype");
+    }
+}
+
+ffi::Error symmetric_literal_forward_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights,
+    ffi::Result<ffi::AnyBuffer> out, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels, int64_t feature_dim,
+    int64_t feature_layout, int64_t output_dim, int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    check_tensor(*out, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal output");
+    zero_buffer(*out, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->forward_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(out), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error symmetric_literal_forward_jvp_x_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights, ffi::AnyBuffer tx,
+    ffi::Result<ffi::AnyBuffer> tout, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels, int64_t feature_dim,
+    int64_t feature_layout, int64_t output_dim, int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    validate_symmetric_feature_buffer(tx, x, "symmetric literal tx");
+    check_tensor(*tout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal JVP output");
+    zero_buffer(*tout, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->forward_jvp_x_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(tx), data_ptr(tout), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error symmetric_literal_backward_x_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights,
+    ffi::AnyBuffer dout, ffi::Result<ffi::AnyBuffer> dx, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels,
+    int64_t feature_dim, int64_t feature_layout, int64_t output_dim,
+    int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    check_tensor(dout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal dout");
+    validate_symmetric_feature_buffer(*dx, x, "symmetric literal dx");
+    zero_buffer(*dx, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->backward_x_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(dout), data_ptr(dx), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error symmetric_literal_backward_jvp_x_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights,
+    ffi::AnyBuffer dout, ffi::AnyBuffer tx, ffi::AnyBuffer tdout,
+    ffi::Result<ffi::AnyBuffer> tdx, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels, int64_t feature_dim,
+    int64_t feature_layout, int64_t output_dim, int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    check_tensor(dout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal dout");
+    validate_symmetric_feature_buffer(tx, x, "symmetric literal tx");
+    check_tensor(tdout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal tdout");
+    validate_symmetric_feature_buffer(*tdx, x, "symmetric literal tdx");
+    zero_buffer(*tdx, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->backward_jvp_x_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(dout), data_ptr(tx), data_ptr(tdout), data_ptr(tdx), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error symmetric_literal_backward_hvp_x_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights,
+    ffi::AnyBuffer dout, ffi::AnyBuffer tx, ffi::Result<ffi::AnyBuffer> tdx,
+    stream_t stream, OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash,
+    int64_t channels, int64_t feature_dim, int64_t feature_layout,
+    int64_t output_dim, int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    check_tensor(dout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal dout");
+    validate_symmetric_feature_buffer(tx, x, "symmetric literal tx");
+    validate_symmetric_feature_buffer(*tdx, x, "symmetric literal tdx");
+    zero_buffer(*tdx, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->backward_hvp_x_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(dout), data_ptr(tx), data_ptr(tdx), stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error symmetric_literal_backward_jvp_xw_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights,
+    ffi::AnyBuffer dout, ffi::AnyBuffer tx, ffi::AnyBuffer tweights,
+    ffi::AnyBuffer tdout, ffi::Result<ffi::AnyBuffer> tdx, stream_t stream,
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t channels,
+    int64_t feature_dim, int64_t feature_layout, int64_t output_dim,
+    int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    check_tensor(dout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal dout");
+    validate_symmetric_feature_buffer(tx, x, "symmetric literal tx");
+    check_tensor(tweights, {num_elements, weight_dim}, x.element_type(),
+                 "symmetric literal tweights");
+    check_tensor(tdout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal tdout");
+    validate_symmetric_feature_buffer(*tdx, x, "symmetric literal tdx");
+    zero_buffer(*tdx, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->backward_jvp_xw_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(dout), data_ptr(tx), data_ptr(tweights), data_ptr(tdout), data_ptr(tdx),
+        stream);
+    return ffi::Error::Success();
+}
+
+ffi::Error symmetric_literal_backward_jvp_xw_transpose_species_impl(
+    ffi::AnyBuffer x, ffi::AnyBuffer species, ffi::AnyBuffer weights,
+    ffi::AnyBuffer dout, ffi::AnyBuffer ctdx, ffi::Result<ffi::AnyBuffer> ctx,
+    ffi::Result<ffi::AnyBuffer> ctweights, ffi::Result<ffi::AnyBuffer> ctdout,
+    stream_t stream, OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash,
+    int64_t channels, int64_t feature_dim, int64_t feature_layout,
+    int64_t output_dim, int64_t weight_dim) {
+    validate_symmetric_inputs(x, species, weights, channels, feature_dim,
+                              feature_layout, weight_dim);
+    const int64_t num_elements = weights.dimensions()[0];
+    const int64_t nodes = x.dimensions()[0];
+    check_tensor(dout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal dout");
+    validate_symmetric_feature_buffer(ctdx, x, "symmetric literal ctdx");
+    validate_symmetric_feature_buffer(*ctx, x, "symmetric literal ctx");
+    check_tensor(*ctweights, {num_elements, weight_dim}, x.element_type(),
+                 "symmetric literal ctweights");
+    check_tensor(*ctdout, {nodes, output_dim}, x.element_type(),
+                 "symmetric literal ctdout");
+    zero_buffer(*ctx, stream);
+    zero_buffer(*ctweights, stream);
+    zero_buffer(*ctdout, stream);
+    auto loaded = symmetric_literal_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto* jit_kernel = *loaded;
+    jit_kernel->backward_jvp_xw_transpose_species(
+        nodes, num_elements, channels, data_ptr(x), data_ptr(species), data_ptr(weights),
+        data_ptr(dout), data_ptr(ctdx), data_ptr(ctx), data_ptr(ctweights),
+        data_ptr(ctdout), stream);
+    return ffi::Error::Success();
+}
+
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>>
+factorized_projected_instantiate_impl(
+    std::string_view source, int64_t hash, int64_t, int64_t, int64_t,
+    int64_t, int64_t) {
+    return instantiate_kernel(KernelFamily::kFactorizedProjected, source, hash);
+}
+
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>>
+symmetric_literal_instantiate_impl(
+    std::string_view source, int64_t hash, int64_t, int64_t, int64_t,
+    int64_t, int64_t) {
+    return instantiate_kernel(KernelFamily::kSymmetricLiteral, source, hash);
+}
+
+ffi::Error generated_initialize_impl(
+    OeqExecutableState* state, int32_t device_ordinal,
+    std::string_view source, int64_t hash, int64_t, int64_t, int64_t,
+    int64_t, int64_t) {
+    return initialize_impl(state, device_ordinal, source, hash);
+}
+
+#define OEQ_GENERATED_CONTEXTS                                                         \
+    .Ctx<ffi::PlatformStream<stream_t>>()                                             \
+        .Ctx<ffi::State<OeqExecutableState>>()                                       \
+        .Ctx<ffi::DeviceOrdinal>()
+
+#define OEQ_GENERATED_ATTRIBUTES                                                      \
+    .Attr<std::string_view>("source")                                               \
+        .Attr<int64_t>("hash")
+
+#define OEQ_PROJECTED_ATTRIBUTES                                                       \
+    OEQ_GENERATED_ATTRIBUTES                                                         \
+        .Attr<int64_t>("channels")                                                     \
+        .Attr<int64_t>("input_dim")                                                    \
+        .Attr<int64_t>("edge_dim")                                                     \
+        .Attr<int64_t>("weight_dim")                                                   \
+        .Attr<int64_t>("output_dim")
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    factorized_projected_instantiate, factorized_projected_instantiate_impl,
+    ffi::Ffi::BindInstantiate() OEQ_PROJECTED_ATTRIBUTES);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    factorized_projected_initialize, generated_initialize_impl,
+    ffi::Ffi::BindInitialize()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
+        OEQ_PROJECTED_ATTRIBUTES);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(factorized_projected_forward,
+                              factorized_projected_forward_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>() OEQ_GENERATED_CONTEXTS
+                                      OEQ_PROJECTED_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(factorized_projected_forward_jvp,
+                              factorized_projected_forward_jvp_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>() OEQ_GENERATED_CONTEXTS
+                                      OEQ_PROJECTED_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(factorized_projected_spatial_backward,
+                              factorized_projected_backward_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>() OEQ_GENERATED_CONTEXTS
+                                      OEQ_PROJECTED_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(factorized_projected_weight_backward,
+                              factorized_projected_weight_backward_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>() OEQ_GENERATED_CONTEXTS
+                                      OEQ_PROJECTED_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(factorized_projected_spatial_backward_jvp,
+                              factorized_projected_backward_jvp_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>() OEQ_GENERATED_CONTEXTS
+                                      OEQ_PROJECTED_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+#undef OEQ_PROJECTED_ATTRIBUTES
+
+#define OEQ_SYMMETRIC_ATTRIBUTES                                                       \
+    OEQ_GENERATED_ATTRIBUTES                                                         \
+        .Attr<int64_t>("channels")                                                     \
+        .Attr<int64_t>("feature_dim")                                                  \
+        .Attr<int64_t>("feature_layout")                                               \
+        .Attr<int64_t>("output_dim")                                                   \
+        .Attr<int64_t>("weight_dim")
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    symmetric_literal_instantiate, symmetric_literal_instantiate_impl,
+    ffi::Ffi::BindInstantiate() OEQ_SYMMETRIC_ATTRIBUTES);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    symmetric_literal_initialize, generated_initialize_impl,
+    ffi::Ffi::BindInitialize()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
+        OEQ_SYMMETRIC_ATTRIBUTES);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_forward_species,
+                              symmetric_literal_forward_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_forward_jvp_x_species,
+                              symmetric_literal_forward_jvp_x_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_backward_x_species,
+                              symmetric_literal_backward_x_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_backward_jvp_x_species,
+                              symmetric_literal_backward_jvp_x_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_backward_hvp_x_species,
+                              symmetric_literal_backward_hvp_x_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_backward_jvp_xw_species,
+                              symmetric_literal_backward_jvp_xw_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(symmetric_literal_backward_jvp_xw_transpose_species,
+                              symmetric_literal_backward_jvp_xw_transpose_species_impl,
+                              ffi::Ffi::Bind()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Ret<ffi::AnyBuffer>()
+                                  OEQ_GENERATED_CONTEXTS OEQ_SYMMETRIC_ATTRIBUTES,
+                              {xla::ffi::Traits::kCmdBufferCompatible});
+
+#undef OEQ_SYMMETRIC_ATTRIBUTES
+#undef OEQ_GENERATED_ATTRIBUTES
+#undef OEQ_GENERATED_CONTEXTS
 
 #define OEQ_FFI_HANDLER(NAME, INSTANTIATE, INITIALIZE)                                \
     {#NAME, reinterpret_cast<void*>(INSTANTIATE),                                    \
@@ -1201,6 +1909,54 @@ const OeqFfiHandler kFfiHandlers[] = {
     OEQ_FFI_HANDLER(conv_backward, conv_instantiate, conv_initialize),
     OEQ_FFI_HANDLER(
         conv_double_backward, conv_instantiate, conv_initialize),
+    OEQ_FFI_HANDLER(
+        factorized_projected_forward,
+        factorized_projected_instantiate,
+        factorized_projected_initialize),
+    OEQ_FFI_HANDLER(
+        factorized_projected_forward_jvp,
+        factorized_projected_instantiate,
+        factorized_projected_initialize),
+    OEQ_FFI_HANDLER(
+        factorized_projected_spatial_backward,
+        factorized_projected_instantiate,
+        factorized_projected_initialize),
+    OEQ_FFI_HANDLER(
+        factorized_projected_weight_backward,
+        factorized_projected_instantiate,
+        factorized_projected_initialize),
+    OEQ_FFI_HANDLER(
+        factorized_projected_spatial_backward_jvp,
+        factorized_projected_instantiate,
+        factorized_projected_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_forward_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_forward_jvp_x_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_backward_x_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_backward_jvp_x_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_backward_hvp_x_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_backward_jvp_xw_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
+    OEQ_FFI_HANDLER(
+        symmetric_literal_backward_jvp_xw_transpose_species,
+        symmetric_literal_instantiate,
+        symmetric_literal_initialize),
 };
 
 #undef OEQ_FFI_HANDLER
@@ -1219,13 +1975,10 @@ const OeqFfiHandlerTable kFfiHandlerTable = {
     kFfiHandlers,
 };
 
-}  // namespace
-
 extern "C" const OeqFfiHandlerTable* oeq_ffi_handler_table() {
     return &kFfiHandlerTable;
 }
 
-// --------------------- NB Module --------------------------
 #ifndef OEQ_NO_PYTHON_MODULE
 NB_MODULE(openequivariance_extjax, m) {
     m.def("type_registrations", []() {
@@ -1263,7 +2016,7 @@ NB_MODULE(openequivariance_extjax, m) {
         .def_ro("major", &DeviceProp::major)
         .def_ro("minor", &DeviceProp::minor)
         .def_ro("multiprocessorCount", &DeviceProp::multiprocessorCount)
-        .def_ro("maxSharedMemPerBlock", &DeviceProp::maxSharedMemPerBlock); 
+        .def_ro("maxSharedMemPerBlock", &DeviceProp::maxSharedMemPerBlock);
 
     nb::class_<GPUTimer>(m, "GPUTimer")
         .def(nb::init<>())

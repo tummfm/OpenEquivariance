@@ -58,6 +58,8 @@ set(OEQ_JAX_SOURCES
 set(OEQ_JAX_HEADERS
   src/ffi_abi.h
   ${HEADER_DIR}/convolution.hpp
+  ${HEADER_DIR}/factorized_projected.hpp
+  ${HEADER_DIR}/symmetric_literal.hpp
   ${HEADER_DIR}/tensorproducts.hpp
   ${HEADER_DIR}/backend/backend_cuda.hpp
   ${HEADER_DIR}/backend/backend_hip.hpp

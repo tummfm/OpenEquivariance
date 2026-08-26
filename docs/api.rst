@@ -63,6 +63,20 @@ memory use. Higher values allow more independent NVRTC compilations to overlap.
     :undoc-members:
     :exclude-members:
 
+.. autoclass:: openequivariance.jax.FactorizedTensorProductConv
+    :members: forward
+    :undoc-members:
+    :exclude-members:
+
+.. autoclass:: openequivariance.jax.SymmetricContraction
+    :members: __call__, from_plan, init_weights
+    :undoc-members:
+    :exclude-members:
+
+The receiver-row streaming algorithm is informed by Chorošajev and Bény,
+`SOBEK: Streaming Equivariant Tensor Product Convolutions
+<https://arxiv.org/abs/2607.18074>`_.
+
 .. autofunction:: openequivariance.jax.transpose_irreps
 
 Common API

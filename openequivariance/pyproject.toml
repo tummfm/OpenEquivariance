@@ -23,7 +23,7 @@ dependencies = [
 readme = "README.md"
 
 license = "BSD-3-Clause"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES"]
 
 classifiers = [
   "Programming Language :: Python :: 3",

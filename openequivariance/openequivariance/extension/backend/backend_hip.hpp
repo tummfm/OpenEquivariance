@@ -197,7 +197,7 @@ public:
     string kernel_plaintext;
     vector<char> kernel_binary;
 
-    HIPJITKernel(string plaintext) :
+    HIPJITKernel(string plaintext, bool /*fast_math*/ = true) :
         kernel_plaintext(plaintext) {
 
         HIPRTC_SAFE_CALL(

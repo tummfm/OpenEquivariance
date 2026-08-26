@@ -1,3 +1,5 @@
+"""JAX tensor-product, convolution, and symmetric-contraction interfaces."""
+
 import jax
 import jax.numpy as jnp
 
@@ -5,6 +7,16 @@ from openequivariance.core.e3nn_lite import Irreps
 from openequivariance.jax.TensorProduct import TensorProduct as TensorProduct
 from openequivariance.jax.TensorProductConv import (
     TensorProductConv as TensorProductConv,
+)
+from openequivariance.jax.FactorizedTensorProductConv import (
+    FactorizedTensorProductConv as FactorizedTensorProductConv,
+)
+from openequivariance.jax.SymmetricContraction import (
+    SymmetricContraction as SymmetricContraction,
+)
+from openequivariance.core.SymmetricContractionPlan import (
+    SymmetricContractionPlan as SymmetricContractionPlan,
+    SymmetricPath as SymmetricPath,
 )
 
 
@@ -78,4 +90,12 @@ def transpose_irreps(
     return out
 
 
-__all__ = ["TensorProduct", "TensorProductConv", "transpose_irreps"]
+__all__ = [
+    "TensorProduct",
+    "TensorProductConv",
+    "FactorizedTensorProductConv",
+    "SymmetricContraction",
+    "SymmetricContractionPlan",
+    "SymmetricPath",
+    "transpose_irreps",
+]

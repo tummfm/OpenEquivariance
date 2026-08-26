@@ -31,8 +31,20 @@ def get_jinja_environment(is_hip=False):
 
     if is_hip:
         env.globals["shfl_down"] = lambda val, offset: f"__shfl_down( {val}, {offset})"
+        env.globals["shfl_xor"] = lambda val, offset: f"__shfl_xor( {val}, {offset})"
+        env.globals["shfl_down_32"] = lambda val, offset: (
+            f"__shfl_down( {val}, {offset}, 32)"
+        )
+        env.globals["shfl_xor_32"] = lambda val, offset: (
+            f"__shfl_xor( {val}, {offset}, 32)"
+        )
     else:
         env.globals["shfl_down"] = (
             lambda val, offset: f"__shfl_down_sync(FULL_MASK, {val}, {offset})"
         )
+        env.globals["shfl_xor"] = lambda val, offset: (
+            f"__shfl_xor_sync(0xffffffffu, {val}, {offset})"
+        )
+        env.globals["shfl_down_32"] = env.globals["shfl_down"]
+        env.globals["shfl_xor_32"] = env.globals["shfl_xor"]
     return env

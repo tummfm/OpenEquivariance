@@ -204,7 +204,8 @@ public:
         const vector<vector<int>>& template_param_list,
         int cu_major,
         int cu_minor,
-        int opt_level=3) {
+        int opt_level=3,
+        bool fast_math=true) {
         (void)opt_level;
 
         if(kernel_names_i.size() != template_param_list.size()) {
@@ -269,11 +270,11 @@ public:
         vector<const char*> opts = {
             "--std=c++17",
             sm.c_str(),
-            "--split-compile=0",
-            // Preserve OEQ's existing fast-math code generation while moving
-            // NVRTC compilation off the execution thread.
-            "--use_fast_math"
+            "--split-compile=0"
         };
+        if(fast_math) {
+            opts.push_back("--use_fast_math");
+        }
 
         for(const string& kernel_name : kernel_names) {
             check_nvrtc(
@@ -352,8 +353,10 @@ private:
 
 public:
     string kernel_plaintext;
+    bool fast_math = true;
 
-    CUJITKernel(string plaintext) : kernel_plaintext(std::move(plaintext)) { }
+    CUJITKernel(string plaintext, bool fast_math_i=true) :
+        kernel_plaintext(std::move(plaintext)), fast_math(fast_math_i) { }
 
     // Load context-less CUkernel handles from a host-compiled CUDA image. The
     // caller-provided launch stream later selects the CUDA context.
@@ -386,7 +389,8 @@ public:
             template_param_list,
             device_prop.major,
             device_prop.minor,
-            opt_level);
+            opt_level,
+            fast_math);
         load(image);
     }
 

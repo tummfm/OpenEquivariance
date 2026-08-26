@@ -74,7 +74,7 @@ def test_exported_handler_table_matches_manifest(with_jax):
     assert table.types[0].type_id
     assert table.types[0].type_info
     assert tuple(names) == FFI_TARGETS
-    assert len(names) == len(set(names)) == 6
+    assert len(names) == len(set(names)) == len(FFI_TARGETS)
     assert all(
         table.handlers[index].instantiate
         for index in range(table.handler_count)
@@ -99,7 +99,8 @@ def test_nanobind_registrations_match_handler_table(with_jax):
     )
     registrations = ext.registrations()
     assert tuple(registrations) == FFI_TARGETS
-    assert len(registrations) == table.handler_count == 6
+    assert len(registrations) == table.handler_count == 18
+
     for index, name in enumerate(FFI_TARGETS):
         handler = table.handlers[index]
         registration = registrations[name]
@@ -119,9 +120,26 @@ def test_handler_families_share_one_initializer(with_jax):
         table.handlers[index].name.decode(): table.handlers[index]
         for index in range(table.handler_count)
     }
-    for family in (
+    families = (
         ("tp_forward", "tp_backward", "tp_double_backward"),
         ("conv_forward", "conv_backward", "conv_double_backward"),
-    ):
+        (
+            "factorized_projected_forward",
+            "factorized_projected_forward_jvp",
+            "factorized_projected_spatial_backward",
+            "factorized_projected_weight_backward",
+            "factorized_projected_spatial_backward_jvp",
+        ),
+        (
+            "symmetric_literal_forward_species",
+            "symmetric_literal_forward_jvp_x_species",
+            "symmetric_literal_backward_x_species",
+            "symmetric_literal_backward_jvp_x_species",
+            "symmetric_literal_backward_hvp_x_species",
+            "symmetric_literal_backward_jvp_xw_species",
+            "symmetric_literal_backward_jvp_xw_transpose_species",
+        ),
+    )
+    for family in families:
         assert len({handlers[name].instantiate for name in family}) == 1
         assert len({handlers[name].initialize for name in family}) == 1
