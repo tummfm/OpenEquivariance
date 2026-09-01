@@ -60,19 +60,16 @@ def test_exported_handler_table_matches_manifest(with_jax):
 
     _, table = _handler_table()
     names = [
-        table.handlers[index].name.decode()
-        for index in range(table.handler_count)
+        table.handlers[index].name.decode() for index in range(table.handler_count)
     ]
     assert table.abi_version == 2
     assert tuple(names) == FFI_TARGETS
     assert len(names) == len(set(names)) == 6
     assert all(
-        not table.handlers[index].instantiate
-        for index in range(table.handler_count)
+        not table.handlers[index].instantiate for index in range(table.handler_count)
     )
     assert all(
-        not table.handlers[index].prepare
-        for index in range(table.handler_count)
+        not table.handlers[index].prepare for index in range(table.handler_count)
     )
     assert all(table.handlers[index].initialize for index in range(table.handler_count))
     assert all(table.handlers[index].execute for index in range(table.handler_count))
@@ -94,11 +91,7 @@ def test_nanobind_registrations_match_handler_table(with_jax):
     for index, name in enumerate(FFI_TARGETS):
         handler = table.handlers[index]
         registration = registrations[name]
-        expected_stages = {
-            stage
-            for stage in FFI_STAGES
-            if getattr(handler, stage)
-        }
+        expected_stages = {stage for stage in FFI_STAGES if getattr(handler, stage)}
         assert set(registration) == expected_stages
         for stage in expected_stages:
             assert _capsule_pointer(registration[stage]) == getattr(handler, stage)
