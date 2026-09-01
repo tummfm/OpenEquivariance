@@ -6,16 +6,10 @@
 #include <unordered_map>
 #include <iostream>
 
-#ifndef OEQ_NO_PYTHON_MODULE
-#include "nanobind/nanobind.h"
-#endif
 #include "xla/ffi/api/ffi.h"
 #include "json11/json11.hpp"
 #include "ffi_abi.h"
 
-#ifndef OEQ_NO_PYTHON_MODULE
-namespace nb = nanobind;
-#endif
 namespace ffi = xla::ffi;
 using json = json11::Json;
 
@@ -658,14 +652,6 @@ ffi::Error conv_double_backward_impl(
     return ffi::Error::Success();
 }
 
-bool is_hip() {
-#ifdef HIP_BACKEND
-    return true;
-#else
-    return false;
-#endif
-}
-
 // --------------------- FFI Bindings --------------------------
 
 ffi::Error tp_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
@@ -754,7 +740,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 namespace {
 
 #define OEQ_FFI_HANDLER(NAME, INITIALIZE)                                             \
-    {#NAME, reinterpret_cast<void*>(INITIALIZE), reinterpret_cast<void*>(NAME)}
+    {#NAME, nullptr, nullptr, reinterpret_cast<void*>(INITIALIZE),                    \
+     reinterpret_cast<void*>(NAME), OEQ_FFI_TRAIT_COMMAND_BUFFER_COMPATIBLE}
 
 const OeqFfiHandler kFfiHandlers[] = {
     OEQ_FFI_HANDLER(tp_forward, tp_initialize),
@@ -778,37 +765,3 @@ const OeqFfiHandlerTable kFfiHandlerTable = {
 extern "C" const OeqFfiHandlerTable* oeq_ffi_handler_table() {
     return &kFfiHandlerTable;
 }
-
-// --------------------- NB Module --------------------------
-#ifndef OEQ_NO_PYTHON_MODULE
-NB_MODULE(openequivariance_extjax, m) {
-    m.def("registrations", []() {
-        nb::dict registrations;
-        const auto* handlers = oeq_ffi_handler_table();
-        for (uint32_t index = 0; index < handlers->handler_count; ++index) {
-            const auto& handler = handlers->handlers[index];
-            nb::dict stages;
-            stages["initialize"] = nb::capsule(handler.initialize);
-            stages["execute"] = nb::capsule(handler.execute);
-            registrations[handler.name] = stages;
-        }
-        return registrations;
-    });
-    m.def("is_hip", &is_hip);
-
-    nb::class_<DeviceProp>(m, "DeviceProp")
-        .def(nb::init<int>())
-        .def_ro("name", &DeviceProp::name)
-        .def_ro("warpsize", &DeviceProp::warpsize)
-        .def_ro("major", &DeviceProp::major)
-        .def_ro("minor", &DeviceProp::minor)
-        .def_ro("multiprocessorCount", &DeviceProp::multiprocessorCount)
-        .def_ro("maxSharedMemPerBlock", &DeviceProp::maxSharedMemPerBlock); 
-
-    nb::class_<GPUTimer>(m, "GPUTimer")
-        .def(nb::init<>())
-        .def("start", &GPUTimer::start)
-        .def("stop_clock_get_elapsed", &GPUTimer::stop_clock_get_elapsed)
-        .def("clear_L2_cache", &GPUTimer::clear_L2_cache);
-}
-#endif

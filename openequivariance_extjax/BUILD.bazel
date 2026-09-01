@@ -21,7 +21,6 @@ cc_library(
     ],
     defines = [
         "CUDA_BACKEND=1",
-        "OEQ_NO_PYTHON_MODULE",
     ],
     includes = [
         "src",

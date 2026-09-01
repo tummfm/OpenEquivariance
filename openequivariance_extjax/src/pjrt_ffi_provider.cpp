@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -23,22 +24,11 @@ const PJRT_FFI* FindFfiExtension(const PJRT_Api* api) {
     return nullptr;
 }
 
-int RegisterHandler(
+int ReportRegistrationError(
         const PJRT_Api* api,
-        const PJRT_FFI* ffi,
+        PJRT_Error* error,
         const OeqFfiHandler& handler,
         const char* platform_name) {
-    PJRT_FFI_Register_Handler_Args args{};
-    args.struct_size = PJRT_FFI_Register_Handler_Args_STRUCT_SIZE;
-    args.target_name = handler.name;
-    args.target_name_size = std::strlen(handler.name);
-    args.handler = handler.execute;
-    args.platform_name = platform_name;
-    args.platform_name_size = std::strlen(platform_name);
-    args.traits = static_cast<PJRT_FFI_Handler_TraitsBits>(
-        PJRT_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE);
-
-    PJRT_Error* error = ffi->register_handler(&args);
     if (error == nullptr) {
         std::cout << "[OpenEquivariance] Registered FFI target "
                   << handler.name << " for " << platform_name << std::endl;
@@ -62,6 +52,98 @@ int RegisterHandler(
     return 1;
 }
 
+bool HasOptionalStages(const OeqFfiHandler& handler) {
+    return handler.instantiate != nullptr || handler.prepare != nullptr ||
+           handler.initialize != nullptr;
+}
+
+bool HasBundleRegistration(const PJRT_FFI* ffi) {
+    constexpr std::size_t kBundleRegistrationSize =
+        offsetof(PJRT_FFI, register_handler_bundle) +
+        sizeof(ffi->register_handler_bundle);
+    return ffi->base.struct_size >= kBundleRegistrationSize &&
+           ffi->register_handler_bundle != nullptr;
+}
+
+bool HasExecuteRegistration(const PJRT_FFI* ffi) {
+    constexpr std::size_t kExecuteRegistrationSize =
+        offsetof(PJRT_FFI, register_handler) + sizeof(ffi->register_handler);
+    return ffi->base.struct_size >= kExecuteRegistrationSize &&
+           ffi->register_handler != nullptr;
+}
+
+int RegisterHandlerBundle(
+        const PJRT_Api* api,
+        const PJRT_FFI* ffi,
+        const OeqFfiHandler& handler,
+        const char* platform_name) {
+    if (handler.execute == nullptr) {
+        std::cerr << "OpenEquivariance FFI target " << handler.name
+                  << " has no execute handler" << std::endl;
+        return 1;
+    }
+
+    PJRT_FFI_Register_Handler_Bundle_Args args{};
+    args.struct_size = PJRT_FFI_Register_Handler_Bundle_Args_STRUCT_SIZE;
+    args.target_name = handler.name;
+    args.target_name_size = std::strlen(handler.name);
+    args.handler_instantiate = handler.instantiate;
+    args.handler_prepare = handler.prepare;
+    args.handler_initialize = handler.initialize;
+    args.handler_execute = handler.execute;
+    args.platform_name = platform_name;
+    args.platform_name_size = std::strlen(platform_name);
+    args.traits = static_cast<PJRT_FFI_Handler_TraitsBits>(handler.traits);
+
+    return ReportRegistrationError(
+        api, ffi->register_handler_bundle(&args), handler, platform_name);
+}
+
+int RegisterExecuteHandler(
+        const PJRT_Api* api,
+        const PJRT_FFI* ffi,
+        const OeqFfiHandler& handler,
+        const char* platform_name) {
+    if (handler.execute == nullptr) {
+        std::cerr << "OpenEquivariance FFI target " << handler.name
+                  << " has no execute handler" << std::endl;
+        return 1;
+    }
+
+    PJRT_FFI_Register_Handler_Args args{};
+    args.struct_size = PJRT_FFI_Register_Handler_Args_STRUCT_SIZE;
+    args.target_name = handler.name;
+    args.target_name_size = std::strlen(handler.name);
+    args.handler = handler.execute;
+    args.platform_name = platform_name;
+    args.platform_name_size = std::strlen(platform_name);
+    args.traits = static_cast<PJRT_FFI_Handler_TraitsBits>(handler.traits);
+
+    return ReportRegistrationError(
+        api, ffi->register_handler(&args), handler, platform_name);
+}
+
+int RegisterHandler(
+        const PJRT_Api* api,
+        const PJRT_FFI* ffi,
+        const OeqFfiHandler& handler,
+        const char* platform_name) {
+    if (HasBundleRegistration(ffi)) {
+        return RegisterHandlerBundle(api, ffi, handler, platform_name);
+    }
+    if (HasOptionalStages(handler)) {
+        std::cerr << "OpenEquivariance FFI target " << handler.name
+                  << " requires PJRT handler-bundle registration, but the "
+                     "loaded PJRT FFI extension does not provide it"
+                  << std::endl;
+        return 1;
+    }
+    if (HasExecuteRegistration(ffi)) {
+        return RegisterExecuteHandler(api, ffi, handler, platform_name);
+    }
+    return 1;
+}
+
 }  // namespace
 
 extern "C" OEQ_FFI_EXPORT int RegisterFFi(
@@ -72,7 +154,10 @@ extern "C" OEQ_FFI_EXPORT int RegisterFFi(
     }
 
     const PJRT_FFI* ffi = FindFfiExtension(api);
-    if (ffi == nullptr || ffi->register_handler == nullptr) {
+    if (ffi == nullptr) {
+        return 1;
+    }
+    if (!HasBundleRegistration(ffi) && !HasExecuteRegistration(ffi)) {
         return 1;
     }
 

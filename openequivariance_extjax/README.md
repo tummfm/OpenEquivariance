@@ -12,12 +12,17 @@ Bazel configuration:
 bazel build @openequivariance_src//openequivariance_extjax:libjcn_ffi_openequivariance.so
 ```
 
-The shared library exports `RegisterFFi(const PJRT_Api*, const char*)`. A
-runtime loader calls this entry point after loading its PJRT plugin. The
-provider registers every target in the OpenEquivariance handler table and
-prints each registered target.
+The handler implementation owns one ABI-versioned table with every XLA stage
+(`instantiate`, `prepare`, `initialize`, and `execute`) plus each target's
+traits. The nanobind extension reads that table and publishes only stages that
+have a handler. The shared library exports `RegisterFFi(const PJRT_Api*, const
+char*)`; a runtime loader calls this entry point after loading its PJRT plugin.
+The provider registers every target in the same table and prints each
+registered target.
 
-The current PJRT C FFI extension accepts an execute handler for each target,
-but it does not accept an XLA FFI handler bundle. The provider therefore uses
-the execute handlers and retains their lazy initialization. JAX registration
-continues to use the separate initialization handlers from the same table.
+The provider prefers PJRT's handler-bundle registration when its trailing
+function pointer is present in the advertised extension size. That path passes
+every non-null stage and the traits from the table. Older PJRT extensions can
+register execute-only targets, but the provider rejects a staged target rather
+than silently losing its initialization. JAX registration uses every non-null
+stage from the same table.

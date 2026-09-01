@@ -52,6 +52,7 @@ endif()
 set(HEADER_DIR "src/extension")
 set(OEQ_JAX_SOURCES
     src/jax_ffi.cpp
+    src/jax_ffi_registration.cpp
     ${HEADER_DIR}/json11/json11.cpp
 )
 
