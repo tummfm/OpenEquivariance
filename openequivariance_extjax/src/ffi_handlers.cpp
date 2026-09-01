@@ -1,53 +1,27 @@
 #include <cstdint>
-#include <mutex>
 #include <string>
-#include <memory>
 #include <string_view>
 #include <unordered_map>
-#include <iostream>
 
 #include "xla/ffi/api/ffi.h"
-#include "json11/json11.hpp"
 #include "ffi_handler_table.h"
-
-namespace ffi = xla::ffi;
-using json = json11::Json;
+#include "kernel_compilation.h"
 
 #ifdef CUDA_BACKEND
     #include <cuda.h>
     #include <cuda_runtime.h>
 
     #include "backend/backend_cuda.hpp"
-    using JITKernel = CUJITKernel;
-    using GPU_Allocator = CUDA_Allocator;
     using stream_t = cudaStream_t;
 #endif
 
 #ifdef HIP_BACKEND
     #include "backend/backend_hip.hpp"
-    using JITKernel = HIPJITKernel;
-    using GPU_Allocator = HIP_Allocator;
     using stream_t = hipStream_t;
 #endif
 
 #include "tensorproducts.hpp"
 #include "convolution.hpp"
-
-xla::ffi::DataType enum_to_xla_dtype(int64_t i){
-    switch(i) {
-        case 1:
-            return xla::ffi::DataType::F32; 
-        case 2: 
-            return xla::ffi::DataType::F64;
-        case 3: 
-            return xla::ffi::DataType::S32;
-        case 4: 
-            return xla::ffi::DataType::S64;
-        case 5: 
-            return xla::ffi::DataType::U8;
-    }
-    throw logic_error("Unsupported tensor datatype!");
-}
 
 std::string xla_dtype_to_string(xla::ffi::DataType dtype) {
     const std::unordered_map<xla::ffi::DataType, std::string> map = {
@@ -124,127 +98,6 @@ void zero_buffer(ffi::AnyBuffer &buffer, stream_t stream) {
 }
 #endif
 
-std::unordered_map<std::string, int64_t> parse_json_config(const json &j_obj) {
-    std::unordered_map<std::string, int64_t> result;
-    for (const auto &kv : j_obj.object_items()) {
-        result[kv.first] = static_cast<int64_t>(kv.second.number_value());
-    }
-    return result;
-}
-
-struct KernelProp {
-    int64_t L1_dim, L2_dim, L3_dim, weight_numel;
-    bool shared_weights;
-    xla::ffi::DataType irrep_dtype;
-    xla::ffi::DataType weight_dtype;
-
-    int64_t workspace_size;     // Convolution only
-    bool deterministic;
-    xla::ffi::DataType idx_dtype;
-    xla::ffi::DataType workspace_dtype;
-
-    KernelProp() {}
-
-    KernelProp(
-        std::unordered_map<string, int64_t> &kernel_dims, bool is_convolution):
-            L1_dim(kernel_dims.at("L1_dim")),
-            L2_dim(kernel_dims.at("L2_dim")),    
-            L3_dim(kernel_dims.at("L3_dim")),
-            weight_numel(kernel_dims.at("weight_numel")),
-            shared_weights(kernel_dims.at("shared_weights")),
-            irrep_dtype(enum_to_xla_dtype(kernel_dims.at("irrep_dtype"))),
-            weight_dtype(enum_to_xla_dtype(kernel_dims.at("weight_dtype"))),
-            workspace_dtype(xla::ffi::DataType::U8) { 
-        if(is_convolution) {
-            workspace_size = kernel_dims.at("workspace_size");
-            deterministic = kernel_dims.at("deterministic");
-            idx_dtype = enum_to_xla_dtype(kernel_dims.at("idx_dtype"));
-        }
-    }
-};
-
-std::unordered_map<int64_t,
-    std::pair<
-        std::unique_ptr<JITTPImpl<JITKernel>>,
-        KernelProp
-    >> tp_cache;
-
-std::unordered_map<int64_t,
-    std::pair<
-        std::unique_ptr<JITConvImpl<JITKernel>>,
-        KernelProp
-    >> conv_cache;
-std::mutex mut;
-
-template <typename Cache, typename Factory>
-typename Cache::mapped_type &find_or_compile_cached(
-    Cache &cache, int64_t hash, Factory &&factory) {
-    const std::lock_guard<std::mutex> lock(mut);
-    auto it = cache.find(hash);
-    if (it == cache.end()) {
-        it = cache.emplace(hash, std::forward<Factory>(factory)()).first;
-    }
-    return it->second;
-}
-
-std::pair<JITTPImpl<JITKernel>*, KernelProp> 
-    compile_tp_with_caching(std::string_view json_payload,
-                    int64_t hash,
-                    bool is_convolution) {
-    
-    auto &cached = find_or_compile_cached(
-        tp_cache, hash, [&] {
-            std::string err;
-            json root = json::parse(std::string(json_payload), err);
-            if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
-
-            std::string kernel_src = root["kernel"].string_value();
-            auto forward_cfg = parse_json_config(root["forward_config"]);
-            auto backward_cfg = parse_json_config(root["backward_config"]);
-            auto dbackward_cfg = parse_json_config(root["double_backward_config"]);
-            auto kernel_prop_map = parse_json_config(root["kernel_prop"]);
-
-            auto jit_tp_impl = std::make_unique<JITTPImpl<JITKernel>>(
-                kernel_src,
-                forward_cfg,
-                backward_cfg,
-                dbackward_cfg,
-                kernel_prop_map);
-            return std::make_pair(std::move(jit_tp_impl),
-                                  KernelProp(kernel_prop_map, is_convolution));
-        });
-    return {cached.first.get(), cached.second};
-}
-
-std::pair<JITConvImpl<JITKernel>*, KernelProp> 
-    compile_conv_with_caching(std::string_view json_payload,
-                    int64_t hash,
-                    bool is_convolution) {
-    
-    auto &cached = find_or_compile_cached(
-        conv_cache, hash, [&] {
-            std::string err;
-            json root = json::parse(std::string(json_payload), err);
-            if (!err.empty()) throw std::runtime_error("JSON Parse Error: " + err);
-
-            std::string kernel_src = root["kernel"].string_value();
-            auto forward_cfg = parse_json_config(root["forward_config"]);
-            auto backward_cfg = parse_json_config(root["backward_config"]);
-            auto dbackward_cfg = parse_json_config(root["double_backward_config"]);
-            auto kernel_prop_map = parse_json_config(root["kernel_prop"]);
-
-            auto jit_conv_impl = std::make_unique<JITConvImpl<JITKernel>>(
-                kernel_src,
-                forward_cfg,
-                backward_cfg,
-                dbackward_cfg,
-                kernel_prop_map);
-            return std::make_pair(std::move(jit_conv_impl),
-                                  KernelProp(kernel_prop_map, is_convolution));
-        });
-    return {cached.first.get(), cached.second};
-}
-
 inline void check_tensor(const ffi::AnyBuffer &buffer, 
                             std::initializer_list<int64_t> expected_shape,
                             xla::ffi::DataType expected_dtype,
@@ -286,11 +139,16 @@ ffi::Error tp_forward_impl(
         ffi::AnyBuffer W,
         ffi::Result<ffi::AnyBuffer> L3_out,
         stream_t stream,
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-   
-    auto [jit_kernel, k] = compile_tp_with_caching(
-        kernel_json, hash, false);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = tensor_product_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const FfiKernelProperties& k = *properties;
     const int64_t num_batch = L1_in.dimensions()[0];
 
     check_tensor(L1_in, {num_batch, k.L1_dim}, k.irrep_dtype, "L1_in");
@@ -321,11 +179,16 @@ ffi::Error tp_backward_impl(
         ffi::Result<ffi::AnyBuffer> L2_grad,
         ffi::Result<ffi::AnyBuffer> W_grad, 
         stream_t stream, 
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_tp_with_caching(
-        kernel_json, hash, false);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = tensor_product_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const FfiKernelProperties& k = *properties;
     const int64_t num_batch = L1_in.dimensions()[0];
     check_tensor(L1_in, {num_batch, k.L1_dim}, k.irrep_dtype, "L1_in");
     check_tensor(L2_in, {num_batch, k.L2_dim}, k.irrep_dtype, "L2_in");
@@ -371,11 +234,16 @@ ffi::Error tp_double_backward_impl(
         ffi::Result<ffi::AnyBuffer> W_grad,
         ffi::Result<ffi::AnyBuffer> L3_dgrad,
         stream_t stream, 
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_tp_with_caching(
-        kernel_json, hash, false);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = tensor_product_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const FfiKernelProperties& k = *properties;
     const int64_t num_batch = L1_in.dimensions()[0];
     check_tensor(L1_in, {num_batch, k.L1_dim}, k.irrep_dtype, "L1_in");
     check_tensor(L2_in, {num_batch, k.L2_dim}, k.irrep_dtype, "L2_in");
@@ -415,19 +283,21 @@ ffi::Error tp_double_backward_impl(
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     tp_forward, tp_forward_impl,
-    ffi::Ffi::Bind()
+    ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});  // cudaGraph enabled
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     tp_backward, tp_backward_impl,
-    ffi::Ffi::Bind()
+    ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
@@ -436,13 +306,15 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     tp_double_backward, tp_double_backward_impl,
-    ffi::Ffi::Bind()
+    ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
@@ -455,6 +327,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
@@ -470,11 +344,16 @@ ffi::Error conv_forward_impl(
         ffi::AnyBuffer transpose_perm,
         ffi::Result<ffi::AnyBuffer> L3_out,
         stream_t stream, 
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-   
-    auto [jit_kernel, k] = compile_conv_with_caching(
-        kernel_json, hash, true);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = convolution_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const FfiKernelProperties& k = *properties;
     const int64_t nnz = rows.dimensions()[0];
     const int64_t node_count = L1_in.dimensions()[0];
     void* workspace_ptr = data_ptr(workspace);
@@ -525,11 +404,16 @@ ffi::Error conv_backward_impl(
         ffi::AnyBuffer workspace,
         ffi::AnyBuffer transpose_perm,
         stream_t stream, 
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_conv_with_caching(
-        kernel_json, hash, true);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = convolution_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const FfiKernelProperties& k = *properties;
     const int64_t nnz = rows.dimensions()[0];
     const int64_t node_count = L1_in.dimensions()[0];
     void* workspace_ptr = data_ptr(workspace);
@@ -594,11 +478,16 @@ ffi::Error conv_double_backward_impl(
         ffi::AnyBuffer workspace,
         ffi::AnyBuffer transpose_perm,
         stream_t stream, 
+        OeqExecutableState* state,
+        int32_t device_ordinal,
         std::string_view kernel_json,
         int64_t hash) {
-    
-    auto [jit_kernel, k] = compile_conv_with_caching(
-        kernel_json, hash, true);
+    (void)kernel_json;
+    (void)hash;
+    auto loaded = convolution_kernel(state, device_ordinal);
+    if (!loaded) return loaded.error();
+    auto [jit_kernel, properties] = *loaded;
+    const FfiKernelProperties& k = *properties;
     const int64_t nnz = rows.dimensions()[0];
     const int64_t node_count = L1_in.dimensions()[0];
     void* workspace_ptr = data_ptr(workspace);
@@ -653,39 +542,69 @@ ffi::Error conv_double_backward_impl(
 }
 
 // --------------------- FFI Bindings --------------------------
+// Instantiation parses and interns static kernel data. Initialization schedules
+// target compilation. Execution loads a cold artifact if needed and launches it.
 
-ffi::Error tp_initialize_impl(ffi::RemainingArgs, ffi::RemainingRets, stream_t,
-                              std::string_view kernel_json, int64_t hash) {
-    compile_tp_with_caching(kernel_json, hash, false);
-    return ffi::Error::Success();
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>> tp_instantiate_impl(
+    ffi::RemainingArgs, ffi::RemainingRets, std::string_view kernel_json,
+    int64_t hash) {
+    return instantiate_tensor_product(kernel_json, hash);
 }
 
-ffi::Error conv_initialize_impl(ffi::RemainingArgs, ffi::RemainingRets, stream_t,
-                                std::string_view kernel_json, int64_t hash) {
-    compile_conv_with_caching(kernel_json, hash, true);
-    return ffi::Error::Success();
+ffi::ErrorOr<std::unique_ptr<OeqExecutableState>> conv_instantiate_impl(
+    ffi::RemainingArgs, ffi::RemainingRets, std::string_view kernel_json,
+    int64_t hash) {
+    return instantiate_convolution(kernel_json, hash);
 }
 
-#define OEQ_STOCK_INITIALIZE_ATTRIBUTES                                                \
-    .RemainingArgs()                                                                   \
-        .RemainingRets()                                                               \
-        .Ctx<ffi::PlatformStream<stream_t>>()                                          \
-        .Attr<std::string_view>("kernel")                                              \
+ffi::Error initialize_impl(
+    ffi::RemainingArgs, ffi::RemainingRets, OeqExecutableState* state,
+    int32_t device_ordinal,
+    std::string_view, int64_t) {
+    return initialize_kernel_state(state, device_ordinal);
+}
+
+#define OEQ_KERNEL_ATTRIBUTES                                                          \
+    .Attr<std::string_view>("kernel")                                                  \
         .Attr<int64_t>("hash")
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    tp_initialize, tp_initialize_impl,
-    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+    tp_instantiate, tp_instantiate_impl,
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInstantiate>()
+        .RemainingArgs()
+        .RemainingRets()
+        OEQ_KERNEL_ATTRIBUTES);
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    conv_initialize, conv_initialize_impl,
-    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+    conv_instantiate, conv_instantiate_impl,
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInstantiate>()
+        .RemainingArgs()
+        .RemainingRets()
+        OEQ_KERNEL_ATTRIBUTES);
 
-#undef OEQ_STOCK_INITIALIZE_ATTRIBUTES
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    tp_initialize, initialize_impl,
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>()
+        .RemainingArgs()
+        .RemainingRets()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
+        OEQ_KERNEL_ATTRIBUTES);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    conv_initialize, initialize_impl,
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>()
+        .RemainingArgs()
+        .RemainingRets()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
+        OEQ_KERNEL_ATTRIBUTES);
+
+#undef OEQ_KERNEL_ATTRIBUTES
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     conv_forward, conv_forward_impl,
-    ffi::Ffi::Bind()
+    ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
@@ -695,13 +614,15 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     conv_backward, conv_backward_impl,
-    ffi::Ffi::Bind()
+    ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
@@ -714,13 +635,15 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     conv_double_backward, conv_double_backward_impl,
-    ffi::Ffi::Bind()
+    ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
@@ -737,29 +660,45 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Ctx<ffi::PlatformStream<stream_t>>()
+        .Ctx<ffi::State<OeqExecutableState>>()
+        .Ctx<ffi::DeviceOrdinal>()
         .Attr<std::string_view>("kernel")
         .Attr<int64_t>("hash"),
         {xla::ffi::Traits::kCmdBufferCompatible});
 
+ffi::TypeId OeqExecutableState::id = {};
+
 namespace {
 
-#define OEQ_FFI_HANDLER(NAME, INITIALIZE)                                             \
-    {#NAME, nullptr, nullptr, reinterpret_cast<void*>(INITIALIZE),                    \
+#define OEQ_FFI_HANDLER(NAME, INSTANTIATE, INITIALIZE)                                \
+    {#NAME, reinterpret_cast<void*>(INSTANTIATE), nullptr,                            \
+     reinterpret_cast<void*>(INITIALIZE),                                              \
      reinterpret_cast<void*>(NAME), OEQ_FFI_TRAIT_COMMAND_BUFFER_COMPATIBLE}
 
 const OeqFfiHandler kFfiHandlers[] = {
-    OEQ_FFI_HANDLER(tp_forward, tp_initialize),
-    OEQ_FFI_HANDLER(tp_backward, tp_initialize),
-    OEQ_FFI_HANDLER(tp_double_backward, tp_initialize),
-    OEQ_FFI_HANDLER(conv_forward, conv_initialize),
-    OEQ_FFI_HANDLER(conv_backward, conv_initialize),
-    OEQ_FFI_HANDLER(conv_double_backward, conv_initialize),
+    OEQ_FFI_HANDLER(tp_forward, tp_instantiate, tp_initialize),
+    OEQ_FFI_HANDLER(tp_backward, tp_instantiate, tp_initialize),
+    OEQ_FFI_HANDLER(tp_double_backward, tp_instantiate, tp_initialize),
+    OEQ_FFI_HANDLER(conv_forward, conv_instantiate, conv_initialize),
+    OEQ_FFI_HANDLER(conv_backward, conv_instantiate, conv_initialize),
+    OEQ_FFI_HANDLER(conv_double_backward, conv_instantiate, conv_initialize),
 };
 
 #undef OEQ_FFI_HANDLER
 
+constexpr ffi::TypeInfo kOeqExecutableStateTypeInfo =
+    ffi::MakeTypeInfo<OeqExecutableState>();
+
+const OeqFfiType kFfiTypes[] = {{
+    "oeq_executable_state",
+    &OeqExecutableState::id,
+    &kOeqExecutableStateTypeInfo,
+}};
+
 const OeqFfiHandlerTable kFfiHandlerTable = {
     OEQ_FFI_ABI_VERSION,
+    sizeof(kFfiTypes) / sizeof(kFfiTypes[0]),
+    kFfiTypes,
     sizeof(kFfiHandlers) / sizeof(kFfiHandlers[0]),
     kFfiHandlers,
 };

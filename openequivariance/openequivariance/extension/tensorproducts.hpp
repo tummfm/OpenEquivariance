@@ -17,6 +17,38 @@ public:
     KernelLaunchConfig forward_config_ref, backward_config_ref, double_backward_config_ref; 
     int opt_level;
 
+    static vector<string> kernel_entry_points() {
+        return {"forward", "backward", "double_backward_A", "double_backward_B"};
+    }
+
+    static vector<vector<int>> kernel_template_parameters() {
+        return {{}, {}, {}, {}};
+    }
+
+#ifdef CUDA_BACKEND
+    static CompiledKernelImage compile_image(
+        const string& jit_kernel, int cu_major, int cu_minor, int opt_level) {
+        return CompiledKernelImage::compile(
+            jit_kernel, kernel_entry_points(), kernel_template_parameters(),
+            cu_major, cu_minor, opt_level);
+    }
+#endif
+
+private:
+    void configure_shared_memory() {
+        if (forward_config_ref.smem > 0) {
+            jit.set_max_smem(0, forward_config_ref.smem);
+            jit.set_max_smem(2, forward_config_ref.smem);
+        }
+        if (backward_config_ref.smem > 0) {
+            jit.set_max_smem(1, backward_config_ref.smem);
+        }
+        if (double_backward_config_ref.smem > 0) {
+            jit.set_max_smem(3, double_backward_config_ref.smem);
+        }
+    }
+
+public:
     JITTPImpl(
         std::string jit_kernel,
         KernelLaunchConfig forward_config_i,
@@ -29,22 +61,25 @@ public:
             double_backward_config_ref(double_backward_config_i),
             opt_level(opt_level_i) {
 
-        vector<string> kernels = {"forward", "backward", "double_backward_A", "double_backward_B"};
-        jit.compile(kernels, {{}, {}, {}, {}}, opt_level); 
-
-        if(forward_config_ref.smem > 0) {
-            jit.set_max_smem(0, forward_config_ref.smem);
-            jit.set_max_smem(2, forward_config_ref.smem);
-        }
-
-        if(backward_config_ref.smem > 0) {
-            jit.set_max_smem(1, backward_config_ref.smem);
-        
-        }
-        if(double_backward_config_ref.smem > 0) {
-            jit.set_max_smem(3, double_backward_config_ref.smem);
-        }
+        jit.compile(kernel_entry_points(), kernel_template_parameters(), opt_level);
+        configure_shared_memory();
     }
+
+#ifdef CUDA_BACKEND
+    JITTPImpl(
+        const CompiledKernelImage& image,
+        KernelLaunchConfig forward_config_i,
+        KernelLaunchConfig backward_config_i,
+        KernelLaunchConfig double_backward_config_i,
+        int opt_level_i)
+        : jit(image),
+          forward_config_ref(forward_config_i),
+          backward_config_ref(backward_config_i),
+          double_backward_config_ref(double_backward_config_i),
+          opt_level(opt_level_i) {
+        configure_shared_memory();
+    }
+#endif
 
     JITTPImpl(
             std::string jit_kernel,
@@ -104,7 +139,6 @@ public:
             &num_products, &L1_in, &L2_in, &W, &L3_grad, &L1_dgrad, &L2_dgrad, &w_dgrad, 
             &L1_grad, &L2_grad, &W_grad, &L3_dgrad
         };
-        double_backward_config_ref.hStream = stream; 
         jit.execute(2, args, with_stream(forward_config_ref, stream));
         jit.execute(3, args, with_stream(double_backward_config_ref, stream));
     }

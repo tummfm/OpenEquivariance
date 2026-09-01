@@ -8,6 +8,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm> 
+#include <utility>
 
 using namespace std;
 using Stream = cudaStream_t;
@@ -152,212 +153,272 @@ public:
 * https://docs.nvidia.com/cuda/nvrtc/index.html#example-using-nvrtcgettypename
 */
 
+class __attribute__((visibility("default"))) CompiledKernelImage {
+private:
+    static void check_nvrtc(nvrtcResult result, const char* operation) {
+        if (result != NVRTC_SUCCESS) {
+            throw std::runtime_error(
+                string(operation) + " failed with error " +
+                nvrtcGetErrorString(result));
+        }
+    }
+
+    struct Program {
+        nvrtcProgram handle = nullptr;
+
+        ~Program() {
+            if (handle != nullptr) {
+                nvrtcDestroyProgram(&handle);
+            }
+        }
+    };
+
+public:
+    vector<char> cubin;
+    vector<string> lowered_kernel_names;
+    int cu_major;
+    int cu_minor;
+
+    CompiledKernelImage(
+        vector<char> cubin_i,
+        vector<string> lowered_kernel_names_i,
+        int cu_major_i,
+        int cu_minor_i)
+        : cubin(std::move(cubin_i)),
+          lowered_kernel_names(std::move(lowered_kernel_names_i)),
+          cu_major(cu_major_i),
+          cu_minor(cu_minor_i) {}
+
+    // This path is host-only so a bounded compiler pool can compile several
+    // kernels without touching the execution thread's CUDA context.
+    static CompiledKernelImage compile(
+        const string& kernel_plaintext,
+        const vector<string>& kernel_names_i,
+        const vector<vector<int>>& template_param_list,
+        int cu_major,
+        int cu_minor,
+        int opt_level = 3) {
+        (void)opt_level;
+        if (kernel_names_i.size() != template_param_list.size()) {
+            throw std::logic_error(
+                "Kernel names and template parameters must have the same size!");
+        }
+
+        int num_supported_archs;
+        check_nvrtc(nvrtcGetNumSupportedArchs(&num_supported_archs),
+                    "nvrtcGetNumSupportedArchs");
+        vector<int> supported_archs(num_supported_archs);
+        check_nvrtc(nvrtcGetSupportedArchs(supported_archs.data()),
+                    "nvrtcGetSupportedArchs");
+        const int device_arch = cu_major * 10 + cu_minor;
+        if (std::find(supported_archs.begin(), supported_archs.end(), device_arch) ==
+            supported_archs.end()) {
+            int nvrtc_version_major;
+            int nvrtc_version_minor;
+            check_nvrtc(nvrtcVersion(&nvrtc_version_major, &nvrtc_version_minor),
+                        "nvrtcVersion");
+            throw std::runtime_error(
+                "NVRTC version " + std::to_string(nvrtc_version_major) + "." +
+                std::to_string(nvrtc_version_minor) +
+                " does not support device architecture " +
+                std::to_string(device_arch));
+        }
+
+        vector<string> kernel_names;
+        kernel_names.reserve(kernel_names_i.size());
+        for (size_t kernel = 0; kernel < kernel_names_i.size(); ++kernel) {
+            const string& kernel_name = kernel_names_i[kernel];
+            const vector<int>& template_params = template_param_list[kernel];
+            if (template_params.empty()) {
+                kernel_names.push_back(kernel_name);
+                continue;
+            }
+            string result = kernel_name + "<";
+            for (size_t index = 0; index < template_params.size(); ++index) {
+                result += std::to_string(template_params[index]);
+                if (index + 1 != template_params.size()) {
+                    result += ",";
+                }
+            }
+            kernel_names.push_back(result + ">");
+        }
+
+        Program program;
+        check_nvrtc(nvrtcCreateProgram(&program.handle, kernel_plaintext.c_str(),
+                                       "kernel.cu", 0, nullptr, nullptr),
+                    "nvrtcCreateProgram");
+        const string sm = "-arch=sm_" + std::to_string(cu_major) +
+                          std::to_string(cu_minor);
+        vector<const char*> options = {
+            "--std=c++17", sm.c_str(), "--split-compile=0"};
+        options.push_back("--use_fast_math");
+        for (const string& kernel_name : kernel_names) {
+            check_nvrtc(nvrtcAddNameExpression(program.handle, kernel_name.c_str()),
+                        "nvrtcAddNameExpression");
+        }
+        const nvrtcResult compile_result = nvrtcCompileProgram(
+            program.handle, static_cast<int>(options.size()), options.data());
+        size_t log_size;
+        check_nvrtc(nvrtcGetProgramLogSize(program.handle, &log_size),
+                    "nvrtcGetProgramLogSize");
+        vector<char> log(log_size);
+        check_nvrtc(nvrtcGetProgramLog(program.handle, log.data()),
+                    "nvrtcGetProgramLog");
+        if (compile_result != NVRTC_SUCCESS) {
+            throw std::logic_error("NVRTC failed, log: " + string(log.data()));
+        }
+
+        size_t cubin_size;
+        check_nvrtc(nvrtcGetCUBINSize(program.handle, &cubin_size),
+                    "nvrtcGetCUBINSize");
+        vector<char> cubin(cubin_size);
+        check_nvrtc(nvrtcGetCUBIN(program.handle, cubin.data()), "nvrtcGetCUBIN");
+        vector<string> lowered_kernel_names;
+        lowered_kernel_names.reserve(kernel_names.size());
+        for (const string& kernel_name : kernel_names) {
+            const char* lowered_name;
+            check_nvrtc(nvrtcGetLoweredName(program.handle, kernel_name.c_str(),
+                                             &lowered_name),
+                        "nvrtcGetLoweredName");
+            lowered_kernel_names.emplace_back(lowered_name);
+        }
+        return CompiledKernelImage(std::move(cubin), std::move(lowered_kernel_names),
+                                   cu_major, cu_minor);
+    }
+};
+
 class __attribute__((visibility("default"))) CUJITKernel {
 private:
-    nvrtcProgram prog;
+    static void check_cuda(CUresult result, const char* operation) {
+        if (result != CUDA_SUCCESS) {
+            throw std::runtime_error(
+                string(operation) + " failed with CUDA error " +
+                std::to_string(static_cast<int>(result)));
+        }
+    }
 
-    bool compiled = false;
-    char* code = nullptr;
-    int cu_major, cu_minor;
+    static void check_cuda_runtime(cudaError_t result, const char* operation) {
+        if (result != cudaSuccess) {
+            throw std::runtime_error(
+                string(operation) + " failed with error " +
+                cudaGetErrorString(result));
+        }
+    }
 
-    CUlibrary library;
-
-    vector<int> supported_archs; 
-
-    vector<string> kernel_names;
+    bool loaded = false;
+    int cu_major = 0;
+    int cu_minor = 0;
+    CUlibrary library = nullptr;
     vector<CUkernel> kernels;
+
+    void load(const CompiledKernelImage& image) {
+        if (loaded) {
+            throw std::logic_error("JIT object has already been loaded!");
+        }
+        check_cuda(cuInit(0), "cuInit");
+        cu_major = image.cu_major;
+        cu_minor = image.cu_minor;
+        check_cuda(
+            cuLibraryLoadData(
+                &library, image.cubin.data(), 0, 0, 0, 0, 0, 0),
+            "cuLibraryLoadData");
+        kernels.reserve(image.lowered_kernel_names.size());
+        for (const string& lowered_name : image.lowered_kernel_names) {
+            CUkernel kernel;
+            check_cuda(
+                cuLibraryGetKernel(&kernel, library, lowered_name.c_str()),
+                "cuLibraryGetKernel");
+            kernels.push_back(kernel);
+        }
+        loaded = true;
+    }
 
 public:
     string kernel_plaintext;
-    CUJITKernel(string plaintext) :
-        kernel_plaintext(plaintext) {
-        
-        int num_supported_archs; 
-        NVRTC_SAFE_CALL(
-        nvrtcGetNumSupportedArchs(&num_supported_archs));
-        
-        supported_archs.resize(num_supported_archs); 
-        NVRTC_SAFE_CALL(
-        nvrtcGetSupportedArchs(supported_archs.data())); 
-        
 
-        NVRTC_SAFE_CALL(
-        nvrtcCreateProgram( &prog,                     // prog
-                            kernel_plaintext.c_str(),  // buffer
-                            "kernel.cu",               // name
-                            0,                         // numHeaders
-                            NULL,                      // headers
-                            NULL));                    // includeNames
+    CUJITKernel(string plaintext) : kernel_plaintext(std::move(plaintext)) {}
+
+    CUJITKernel(const CompiledKernelImage& image) { load(image); }
+
+    void compile(string kernel_name, const vector<int> template_params,
+                 int opt_level = 3) {
+        compile(vector<string>{kernel_name}, vector<vector<int>>{template_params},
+                opt_level);
     }
 
-    void compile(string kernel_name, const vector<int> template_params, int opt_level=3) {
-        vector<string> kernel_names = {kernel_name};
-        vector<vector<int>> template_param_list = {template_params};
-        compile(kernel_names, template_param_list);
-    }
-
-    void compile(vector<string> kernel_names_i, vector<vector<int>> template_param_list, int opt_level=3) {
-        DeviceProp dp(0); // We only query the first device on the system at the moment
-        cu_major = dp.major;
-        cu_minor = dp.minor;
-
-        if(compiled) {
+    void compile(const vector<string>& kernel_names_i,
+                 const vector<vector<int>>& template_param_list,
+                 int opt_level = 3) {
+        if (loaded) {
             throw std::logic_error("JIT object has already been compiled!");
         }
-
-        if(kernel_names_i.size() != template_param_list.size()) {
-            throw std::logic_error("Kernel names and template parameters must have the same size!");
-        }
-
-        int device_arch = cu_major * 10 + cu_minor;
-        if (std::find(supported_archs.begin(), supported_archs.end(), device_arch) == supported_archs.end()){
-            int nvrtc_version_major, nvrtc_version_minor; 
-            NVRTC_SAFE_CALL(
-            nvrtcVersion(&nvrtc_version_major, &nvrtc_version_minor)); 
-
-            throw std::runtime_error("NVRTC version " 
-                + std::to_string(nvrtc_version_major) 
-                + "." 
-                + std::to_string(nvrtc_version_minor) 
-                + " does not support device architecture " 
-                + std::to_string(device_arch)
-        );
-        }
-
-        for(unsigned int kernel = 0; kernel < kernel_names_i.size(); kernel++) {
-            string kernel_name = kernel_names_i[kernel];
-            vector<int> &template_params = template_param_list[kernel];
-
-            // Step 1: Generate kernel names from the template parameters 
-            if(template_params.size() == 0) {
-                kernel_names.push_back(kernel_name);
-            }
-            else {
-                std::string result = kernel_name + "<";
-                for(unsigned int i = 0; i < template_params.size(); i++) {
-                    result += std::to_string(template_params[i]); 
-                    if(i != template_params.size() - 1) {
-                        result += ",";
-                    }
-                }
-                result += ">";
-                kernel_names.push_back(result);
-            }
-
-        }
-        
-        std::string sm = "-arch=sm_" + std::to_string(cu_major) + std::to_string(cu_minor);
-
-        std::vector<const char*> opts = {
-            "--std=c++17",
-            sm.c_str(),
-            "--split-compile=0",
-            "--use_fast_math"
-        };    
-
-        // =========================================================
-        // Step 2: Add name expressions, compile 
-        for(size_t i = 0; i < kernel_names.size(); ++i)
-            NVRTC_SAFE_CALL(nvrtcAddNameExpression(prog, kernel_names[i].c_str()));
-
-        nvrtcResult compileResult = nvrtcCompileProgram(prog,  // prog
-                                                        static_cast<int>(opts.size()),     // numOptions
-                                                        opts.data()); // options
-
-        size_t logSize;
-        NVRTC_SAFE_CALL(nvrtcGetProgramLogSize(prog, &logSize));
-        char *log = new char[logSize];
-        NVRTC_SAFE_CALL(nvrtcGetProgramLog(prog, log));
-
-        if (compileResult != NVRTC_SUCCESS) {
-            throw std::logic_error("NVRTC Fail, log: " + std::string(log));
-        } 
-        delete[] log;
-        compiled = true;
-
-        // =========================================================
-        // Step 3: Get PTX, initialize device, context, and module 
-
-        size_t codeSize;
-        NVRTC_SAFE_CALL(nvrtcGetCUBINSize(prog, &codeSize));
-        code = new char[codeSize];
-        NVRTC_SAFE_CALL(nvrtcGetCUBIN(prog, code));
-
-        CUDA_SAFE_CALL(cuInit(0));
-        CUDA_SAFE_CALL(cuLibraryLoadData(&library, code, 0, 0, 0, 0, 0, 0));
-
-        for (size_t i = 0; i < kernel_names.size(); i++) {
-            const char *name;
-
-            NVRTC_SAFE_CALL(nvrtcGetLoweredName(
-                                    prog,
-                    kernel_names[i].c_str(), // name expression
-                    &name                    // lowered name
-                    ));
-
-            kernels.emplace_back();
-            CUDA_SAFE_CALL(cuLibraryGetKernel(&(kernels[i]), library, name));
-        }
+        int device;
+        check_cuda_runtime(cudaGetDevice(&device), "cudaGetDevice");
+        DeviceProp device_prop(device);
+        CompiledKernelImage image = CompiledKernelImage::compile(
+            kernel_plaintext, kernel_names_i, template_param_list,
+            device_prop.major, device_prop.minor, opt_level);
+        load(image);
     }
 
     void set_max_smem(int kernel_id, uint32_t max_smem_bytes) {
-        if(!compiled)
+        if (!loaded) {
             throw std::logic_error("JIT object has not been compiled!");
-        if(kernel_id >= kernels.size())
+        }
+        if (kernel_id >= kernels.size()) {
             throw std::logic_error("Kernel index out of range!");
-
+        }
         int device_count;
-        CUDA_SAFE_CALL(cuDeviceGetCount(&device_count));
-
-        for(int i = 0; i < device_count; i++) {
-            DeviceProp dp(i);
-            if(dp.major == cu_major && dp.minor == cu_minor) {
-                CUdevice dev;
-                CUDA_SAFE_CALL(cuDeviceGet(&dev, i));
-                CUDA_SAFE_CALL(cuKernelSetAttribute(
+        check_cuda(cuDeviceGetCount(&device_count), "cuDeviceGetCount");
+        for (int device_id = 0; device_id < device_count; ++device_id) {
+            DeviceProp device_prop(device_id);
+            if (device_prop.major == cu_major && device_prop.minor == cu_minor) {
+                CUdevice device;
+                check_cuda(cuDeviceGet(&device, device_id), "cuDeviceGet");
+                check_cuda(
+                    cuKernelSetAttribute(
                         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        max_smem_bytes,
-                        kernels[kernel_id],
-                        dev));
+                        max_smem_bytes, kernels[kernel_id], device),
+                    "cuKernelSetAttribute");
             }
         }
     }
 
     void execute(int kernel_id, void* args[], KernelLaunchConfig config) {
-        if(kernel_id >= kernels.size())
-            throw std::logic_error("Kernel index out of range!");
-
-        CUcontext pctx = NULL; 
-        CUDA_SAFE_CALL(cuCtxGetCurrent(&pctx));
-
-        if(pctx == NULL) {
-            int device_id;
-            CUdevice dev;
-            CUDA_ERRCHK(cudaGetDevice(&device_id));
-            CUDA_SAFE_CALL(cuDeviceGet(&dev, device_id));
-            CUDA_SAFE_CALL(cuDevicePrimaryCtxRetain(&pctx, dev));
-            CUDA_SAFE_CALL(cuCtxSetCurrent(pctx));
+        if (!loaded) {
+            throw std::logic_error("JIT object has not been compiled!");
         }
-
-        CUDA_SAFE_CALL(
-            cuLaunchKernel( (CUfunction) (kernels[kernel_id]),
-                            config.num_blocks, 1, 1,    // grid dim
-                            config.num_threads, 1, 1,   // block dim
-                            config.smem, config.hStream,       // shared mem and stream
-                            args, NULL)          // arguments
-        );            
+        if (kernel_id >= kernels.size()) {
+            throw std::logic_error("Kernel index out of range!");
+        }
+        CUcontext context = nullptr;
+        check_cuda(cuCtxGetCurrent(&context), "cuCtxGetCurrent");
+        if (context == nullptr) {
+            int device_id;
+            CUdevice device;
+            check_cuda_runtime(cudaGetDevice(&device_id), "cudaGetDevice");
+            check_cuda(cuDeviceGet(&device, device_id), "cuDeviceGet");
+            check_cuda(
+                cuDevicePrimaryCtxRetain(&context, device),
+                "cuDevicePrimaryCtxRetain");
+            check_cuda(cuCtxSetCurrent(context), "cuCtxSetCurrent");
+        }
+        check_cuda(
+            cuLaunchKernel(
+                (CUfunction) kernels[kernel_id], config.num_blocks, 1, 1,
+                config.num_threads, 1, 1, config.smem, config.hStream, args,
+                nullptr),
+            "cuLaunchKernel");
     }
 
     ~CUJITKernel() {
-        if(compiled) {
-            auto result = cuLibraryUnload(library);
+        if (loaded) {
+            const CUresult result = cuLibraryUnload(library);
             if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED) {
-                std::cout << "Failed to unload CUDA library, error code: " << ((int) result) << std::endl; 
+                std::cout << "Failed to unload CUDA library, error code: "
+                          << static_cast<int>(result) << std::endl;
             }
-
-            delete[] code;
         }
-        NVRTC_SAFE_CALL(nvrtcDestroyProgram(&prog));
     }
 };
 

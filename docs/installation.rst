@@ -8,7 +8,7 @@ Installation
 You need the following to install OpenEquivariance:
 
 - A Linux system equipped with an NVIDIA / AMD graphics card.
-- Either PyTorch >= 2.4 (>= 2.8 for AOTI and export), or JAX>0.5.0 
+- Either PyTorch >= 2.4 (>= 2.8 for AOTI and export), or JAX >= 0.8.2
   with CUDA or RocM support. 
 - GCC 9+ and the CUDA / HIP toolkit. The command
   ``c++ --version`` should return >= 9.0; see below for details on 
@@ -98,6 +98,30 @@ If you're using JAX, set the environment variable
 
     export OEQ_NOTORCH=1
     python -c "import openequivariance.jax"
+
+JAX kernel compilation
+----------------------
+
+The CUDA JAX extension compiles generated kernels in parallel. Configure it
+with the following environment variables before importing OpenEquivariance:
+
+``OEQ_JAX_COMPILER_THREADS``
+    Number of kernels compiled at the same time. The valid range is 1 to 64,
+    and the default is 8.
+
+``OEQ_JAX_COMPILER_QUEUE_CAPACITY``
+    Number of compilation jobs that may wait for a worker. The valid range is
+    1 to 256, and the default is 32. Submission waits when the queue is full.
+
+For example, this configuration compiles up to 16 kernels at once:
+
+.. code-block:: bash
+
+    export OEQ_JAX_COMPILER_THREADS=16
+    python application.py
+
+These variables are read once when kernel compilation first starts. The HIP
+path compiles synchronously and does not use these settings.
 
 
 Configurations on Major Platforms 
