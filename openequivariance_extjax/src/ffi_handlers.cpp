@@ -8,7 +8,7 @@
 
 #include "xla/ffi/api/ffi.h"
 #include "json11/json11.hpp"
-#include "ffi_abi.h"
+#include "ffi_handler_table.h"
 
 namespace ffi = xla::ffi;
 using json = json11::Json;

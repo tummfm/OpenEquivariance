@@ -10,8 +10,8 @@
 #define OEQ_FFI_EXPORT
 #endif
 
-// Stable, Python-free view of XLA FFI handlers. Consumers must reject a table
-// with an unknown ABI version or entry layout.
+// This is a stable, Python-free view of XLA FFI handlers. Consumers must
+// reject a table with an unknown ABI version or entry layout.
 #ifdef __cplusplus
 extern "C" {
 #endif

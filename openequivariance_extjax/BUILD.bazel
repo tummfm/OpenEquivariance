@@ -3,16 +3,16 @@ licenses(["notice"])
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
-    name = "xla_ffi_handlers",
+    name = "ffi_handlers",
     srcs = [
-        "src/jax_ffi.cpp",
+        "src/ffi_handlers.cpp",
         "src/extension/json11/json11.cpp",
     ],
     hdrs = glob([
         "src/extension/**/*.h",
         "src/extension/**/*.hpp",
         "src/extension/**/*.inl",
-    ]) + ["src/ffi_abi.h"],
+    ]) + ["src/ffi_handler_table.h"],
     alwayslink = True,
     copts = [
         "-std=c++17",
@@ -38,13 +38,12 @@ cc_library(
 
 cc_binary(
     name = "libjcn_ffi_openequivariance.so",
-    srcs = ["src/pjrt_ffi_provider.cpp"],
+    srcs = ["src/ffi_provider.cpp"],
     linkopts = ["-Wl,--no-undefined"],
     linkshared = True,
     tags = ["manual"],
     deps = [
-        ":xla_ffi_handlers",
-        "@xla//xla/pjrt/c:pjrt_c_api_ffi_extension_hdrs",
-        "@xla//xla/pjrt/c:pjrt_c_api_hdrs",
+        ":ffi_handlers",
+        "@xla//xla/ffi/api:c_api",
     ],
 )

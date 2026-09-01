@@ -1,6 +1,6 @@
 #include "nanobind/nanobind.h"
 
-#include "ffi_abi.h"
+#include "ffi_handler_table.h"
 
 #ifdef CUDA_BACKEND
 #include "backend/backend_cuda.hpp"

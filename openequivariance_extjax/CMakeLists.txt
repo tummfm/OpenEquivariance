@@ -51,13 +51,13 @@ endif()
 
 set(HEADER_DIR "src/extension")
 set(OEQ_JAX_SOURCES
-    src/jax_ffi.cpp
+    src/ffi_handlers.cpp
     src/jax_ffi_registration.cpp
     ${HEADER_DIR}/json11/json11.cpp
 )
 
 set(OEQ_JAX_HEADERS
-  src/ffi_abi.h
+  src/ffi_handler_table.h
   ${HEADER_DIR}/convolution.hpp
   ${HEADER_DIR}/tensorproducts.hpp
   ${HEADER_DIR}/backend/backend_cuda.hpp
