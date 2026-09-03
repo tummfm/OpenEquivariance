@@ -666,8 +666,6 @@ ffi::Error conv_initialize_impl(ffi::RemainingArgs, ffi::RemainingRets, stream_t
     return ffi::Error::Success();
 }
 
-// The initialize stage receives the same call frame as execute (operands and
-// results included), so the binding must tolerate them.
 #define OEQ_STOCK_INITIALIZE_ATTRIBUTES                                                \
     .RemainingArgs()                                                                   \
         .RemainingRets()                                                               \
