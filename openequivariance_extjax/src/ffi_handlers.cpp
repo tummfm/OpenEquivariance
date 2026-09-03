@@ -654,28 +654,34 @@ ffi::Error conv_double_backward_impl(
 
 // --------------------- FFI Bindings --------------------------
 
-ffi::Error tp_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
+ffi::Error tp_initialize_impl(ffi::RemainingArgs, ffi::RemainingRets, stream_t,
+                              std::string_view kernel_json, int64_t hash) {
     compile_tp_with_caching(kernel_json, hash, false);
     return ffi::Error::Success();
 }
 
-ffi::Error conv_initialize_impl(stream_t, std::string_view kernel_json, int64_t hash) {
+ffi::Error conv_initialize_impl(ffi::RemainingArgs, ffi::RemainingRets, stream_t,
+                                std::string_view kernel_json, int64_t hash) {
     compile_conv_with_caching(kernel_json, hash, true);
     return ffi::Error::Success();
 }
 
+// The initialize stage receives the same call frame as execute (operands and
+// results included), so the binding must tolerate them.
 #define OEQ_STOCK_INITIALIZE_ATTRIBUTES                                                \
-    .Ctx<ffi::PlatformStream<stream_t>>()                                              \
+    .RemainingArgs()                                                                   \
+        .RemainingRets()                                                               \
+        .Ctx<ffi::PlatformStream<stream_t>>()                                          \
         .Attr<std::string_view>("kernel")                                              \
         .Attr<int64_t>("hash")
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     tp_initialize, tp_initialize_impl,
-    ffi::Ffi::BindInitialize() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     conv_initialize, conv_initialize_impl,
-    ffi::Ffi::BindInitialize() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
+    ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>() OEQ_STOCK_INITIALIZE_ATTRIBUTES);
 
 #undef OEQ_STOCK_INITIALIZE_ATTRIBUTES
 
