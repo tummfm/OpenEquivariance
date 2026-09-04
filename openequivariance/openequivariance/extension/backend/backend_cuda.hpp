@@ -8,6 +8,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm> 
+#include <utility>
 
 using namespace std;
 using Stream = cudaStream_t;
@@ -152,68 +153,98 @@ public:
 * https://docs.nvidia.com/cuda/nvrtc/index.html#example-using-nvrtcgettypename
 */
 
+// This object owns host-side compiled code. CUJITKernel owns the loaded CUDA module.
+struct __attribute__((visibility("default"))) CompiledKernelImage {
+    vector<char> code;
+    vector<string> kernel_names;
+    int cu_major;
+    int cu_minor;
+};
+
 class __attribute__((visibility("default"))) CUJITKernel {
 private:
-    nvrtcProgram prog;
+    static void check_nvrtc(nvrtcResult result, const char* operation) {
+        if (result != NVRTC_SUCCESS) {
+            throw std::runtime_error(
+                string(operation) + " failed with error " +
+                nvrtcGetErrorString(result));
+        }
+    }
+
+    struct Program {
+        nvrtcProgram handle = nullptr;
+
+        ~Program() {
+            if (handle != nullptr) {
+                nvrtcDestroyProgram(&handle);
+            }
+        }
+    };
 
     bool compiled = false;
-    char* code = nullptr;
     int cu_major, cu_minor;
 
     CUlibrary library;
 
-    vector<int> supported_archs; 
-
-    vector<string> kernel_names;
     vector<CUkernel> kernels;
+
+    void load(const CompiledKernelImage& image) {
+        if(compiled) {
+            throw std::logic_error("JIT object has already been compiled!");
+        }
+
+        cu_major = image.cu_major;
+        cu_minor = image.cu_minor;
+
+        CUDA_SAFE_CALL(cuInit(0));
+        CUDA_SAFE_CALL(
+        cuLibraryLoadData(&library, image.code.data(), 0, 0, 0, 0, 0, 0));
+
+        for (size_t i = 0; i < image.kernel_names.size(); i++) {
+            kernels.emplace_back();
+            CUDA_SAFE_CALL(
+            cuLibraryGetKernel(&(kernels[i]), library, image.kernel_names[i].c_str()));
+        }
+        compiled = true;
+    }
 
 public:
     string kernel_plaintext;
     CUJITKernel(string plaintext) :
-        kernel_plaintext(plaintext) {
-        
-        int num_supported_archs; 
-        NVRTC_SAFE_CALL(
-        nvrtcGetNumSupportedArchs(&num_supported_archs));
-        
-        supported_archs.resize(num_supported_archs); 
-        NVRTC_SAFE_CALL(
-        nvrtcGetSupportedArchs(supported_archs.data())); 
-        
+        kernel_plaintext(plaintext) { }
 
-        NVRTC_SAFE_CALL(
-        nvrtcCreateProgram( &prog,                     // prog
-                            kernel_plaintext.c_str(),  // buffer
-                            "kernel.cu",               // name
-                            0,                         // numHeaders
-                            NULL,                      // headers
-                            NULL));                    // includeNames
-    }
+    CUJITKernel(const CompiledKernelImage& image) { load(image); }
 
-    void compile(string kernel_name, const vector<int> template_params, int opt_level=3) {
-        vector<string> kernel_names = {kernel_name};
-        vector<vector<int>> template_param_list = {template_params};
-        compile(kernel_names, template_param_list);
-    }
-
-    void compile(vector<string> kernel_names_i, vector<vector<int>> template_param_list, int opt_level=3) {
-        DeviceProp dp(0); // We only query the first device on the system at the moment
-        cu_major = dp.major;
-        cu_minor = dp.minor;
-
-        if(compiled) {
-            throw std::logic_error("JIT object has already been compiled!");
-        }
+    static CompiledKernelImage compile_image(
+        const string& kernel_plaintext,
+        vector<string> kernel_names_i,
+        vector<vector<int>> template_param_list,
+        int cu_major,
+        int cu_minor,
+        int opt_level=3) {
+        (void)opt_level;
 
         if(kernel_names_i.size() != template_param_list.size()) {
             throw std::logic_error("Kernel names and template parameters must have the same size!");
         }
 
+        int num_supported_archs;
+        check_nvrtc(
+        nvrtcGetNumSupportedArchs(&num_supported_archs),
+        "nvrtcGetNumSupportedArchs");
+
+        vector<int> supported_archs;
+        supported_archs.resize(num_supported_archs);
+        check_nvrtc(
+        nvrtcGetSupportedArchs(supported_archs.data()),
+        "nvrtcGetSupportedArchs");
+
         int device_arch = cu_major * 10 + cu_minor;
         if (std::find(supported_archs.begin(), supported_archs.end(), device_arch) == supported_archs.end()){
             int nvrtc_version_major, nvrtc_version_minor; 
-            NVRTC_SAFE_CALL(
-            nvrtcVersion(&nvrtc_version_major, &nvrtc_version_minor)); 
+            check_nvrtc(
+            nvrtcVersion(&nvrtc_version_major, &nvrtc_version_minor),
+            "nvrtcVersion");
 
             throw std::runtime_error("NVRTC version " 
                 + std::to_string(nvrtc_version_major) 
@@ -224,6 +255,7 @@ public:
         );
         }
 
+        vector<string> kernel_names;
         for(unsigned int kernel = 0; kernel < kernel_names_i.size(); kernel++) {
             string kernel_name = kernel_names_i[kernel];
             vector<int> &template_params = template_param_list[kernel];
@@ -243,9 +275,18 @@ public:
                 result += ">";
                 kernel_names.push_back(result);
             }
-
         }
-        
+
+        Program program;
+        check_nvrtc(
+        nvrtcCreateProgram( &program.handle,              // prog
+                            kernel_plaintext.c_str(),      // buffer
+                            "kernel.cu",                   // name
+                            0,                             // numHeaders
+                            NULL,                          // headers
+                            NULL),                         // includeNames
+        "nvrtcCreateProgram");
+
         std::string sm = "-arch=sm_" + std::to_string(cu_major) + std::to_string(cu_minor);
 
         std::vector<const char*> opts = {
@@ -258,46 +299,68 @@ public:
         // =========================================================
         // Step 2: Add name expressions, compile 
         for(size_t i = 0; i < kernel_names.size(); ++i)
-            NVRTC_SAFE_CALL(nvrtcAddNameExpression(prog, kernel_names[i].c_str()));
+            check_nvrtc(
+            nvrtcAddNameExpression(program.handle, kernel_names[i].c_str()),
+            "nvrtcAddNameExpression");
 
-        nvrtcResult compileResult = nvrtcCompileProgram(prog,  // prog
+        nvrtcResult compileResult = nvrtcCompileProgram(program.handle,  // prog
                                                         static_cast<int>(opts.size()),     // numOptions
                                                         opts.data()); // options
 
         size_t logSize;
-        NVRTC_SAFE_CALL(nvrtcGetProgramLogSize(prog, &logSize));
-        char *log = new char[logSize];
-        NVRTC_SAFE_CALL(nvrtcGetProgramLog(prog, log));
+        check_nvrtc(nvrtcGetProgramLogSize(program.handle, &logSize),
+                    "nvrtcGetProgramLogSize");
+        vector<char> log(logSize);
+        check_nvrtc(nvrtcGetProgramLog(program.handle, log.data()),
+                    "nvrtcGetProgramLog");
 
         if (compileResult != NVRTC_SUCCESS) {
-            throw std::logic_error("NVRTC Fail, log: " + std::string(log));
-        } 
-        delete[] log;
-        compiled = true;
+            throw std::logic_error("NVRTC Fail, log: " + std::string(log.data()));
+        }
 
         // =========================================================
-        // Step 3: Get PTX, initialize device, context, and module 
-
+        // Step 3: Get the compiled code and lowered kernel names
         size_t codeSize;
-        NVRTC_SAFE_CALL(nvrtcGetCUBINSize(prog, &codeSize));
-        code = new char[codeSize];
-        NVRTC_SAFE_CALL(nvrtcGetCUBIN(prog, code));
+        check_nvrtc(nvrtcGetCUBINSize(program.handle, &codeSize),
+                    "nvrtcGetCUBINSize");
+        vector<char> code(codeSize);
+        check_nvrtc(nvrtcGetCUBIN(program.handle, code.data()),
+                    "nvrtcGetCUBIN");
 
-        CUDA_SAFE_CALL(cuInit(0));
-        CUDA_SAFE_CALL(cuLibraryLoadData(&library, code, 0, 0, 0, 0, 0, 0));
-
+        vector<string> lowered_kernel_names;
         for (size_t i = 0; i < kernel_names.size(); i++) {
             const char *name;
 
-            NVRTC_SAFE_CALL(nvrtcGetLoweredName(
-                                    prog,
+            check_nvrtc(
+            nvrtcGetLoweredName(
+                    program.handle,
                     kernel_names[i].c_str(), // name expression
                     &name                    // lowered name
-                    ));
+                    ),
+            "nvrtcGetLoweredName");
 
-            kernels.emplace_back();
-            CUDA_SAFE_CALL(cuLibraryGetKernel(&(kernels[i]), library, name));
+            lowered_kernel_names.emplace_back(name);
         }
+
+        return CompiledKernelImage{
+            std::move(code), std::move(lowered_kernel_names),
+            cu_major, cu_minor};
+    }
+
+    void compile(string kernel_name, const vector<int> template_params, int opt_level=3) {
+        vector<string> kernel_names = {kernel_name};
+        vector<vector<int>> template_param_list = {template_params};
+        compile(kernel_names, template_param_list);
+    }
+
+    void compile(vector<string> kernel_names_i, vector<vector<int>> template_param_list, int opt_level=3) {
+        int device_id;
+        CUDA_ERRCHK(cudaGetDevice(&device_id));
+        DeviceProp dp(device_id);
+        CompiledKernelImage image = compile_image(
+            kernel_plaintext, kernel_names_i, template_param_list,
+            dp.major, dp.minor, opt_level);
+        load(image);
     }
 
     void set_max_smem(int kernel_id, uint32_t max_smem_bytes) {
@@ -354,10 +417,7 @@ public:
             if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED) {
                 std::cout << "Failed to unload CUDA library, error code: " << ((int) result) << std::endl; 
             }
-
-            delete[] code;
         }
-        NVRTC_SAFE_CALL(nvrtcDestroyProgram(&prog));
     }
 };
 

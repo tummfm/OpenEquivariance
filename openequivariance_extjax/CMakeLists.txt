@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.15...3.30)
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(Threads REQUIRED)
 
 # --- XLA CONFIGURATION ---
 if(XLA_DIRECT_DOWNLOAD)
@@ -53,11 +54,13 @@ set(HEADER_DIR "src/extension")
 set(OEQ_JAX_SOURCES
     src/ffi_handlers.cpp
     src/jax_ffi_registration.cpp
+    src/kernel_compilation.cpp
     ${HEADER_DIR}/json11/json11.cpp
 )
 
 set(OEQ_JAX_HEADERS
   src/ffi_handler_table.h
+  src/kernel_compilation.h
   ${HEADER_DIR}/convolution.hpp
   ${HEADER_DIR}/tensorproducts.hpp
   ${HEADER_DIR}/backend/backend_cuda.hpp
@@ -67,6 +70,7 @@ set(OEQ_JAX_HEADERS
 
 nanobind_add_module(openequivariance_extjax NB_STATIC ${OEQ_JAX_SOURCES} ${OEQ_JAX_HEADERS})
 target_include_directories(openequivariance_extjax PUBLIC ${XLA_DIR} ${HEADER_DIR})
+target_link_libraries(openequivariance_extjax PRIVATE Threads::Threads)
 set_target_properties(openequivariance_extjax PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(openequivariance_extjax PRIVATE -Wno-attributes -Wno-return-type)
 

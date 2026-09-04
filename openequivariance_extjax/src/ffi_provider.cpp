@@ -8,19 +8,58 @@
 extern "C" OEQ_FFI_EXPORT int RegisterFFi(
         const XLA_FFI_Api* api,
         const char* platform_name) {
-    constexpr std::size_t kHandlerRegistrationSize =
-        offsetof(XLA_FFI_Api, XLA_FFI_Handler_Register) +
-        sizeof(api->XLA_FFI_Handler_Register);
     if (api == nullptr || platform_name == nullptr ||
-        api->struct_size < kHandlerRegistrationSize ||
-        api->XLA_FFI_Handler_Register == nullptr ||
+        api->struct_size < XLA_FFI_Api_STRUCT_SIZE ||
+        api->XLA_FFI_Error_Create == nullptr ||
         api->XLA_FFI_Error_GetMessage == nullptr ||
-        api->XLA_FFI_Error_Destroy == nullptr) {
+        api->XLA_FFI_Error_Destroy == nullptr ||
+        api->XLA_FFI_Handler_Register == nullptr ||
+        api->XLA_FFI_Stream_Get == nullptr ||
+        api->XLA_FFI_Type_Register == nullptr ||
+        api->XLA_FFI_State_Set == nullptr ||
+        api->XLA_FFI_State_Get == nullptr ||
+        api->XLA_FFI_DeviceOrdinal_Get == nullptr) {
         return 1;
     }
 
     const OeqFfiHandlerTable* handlers = oeq_ffi_handler_table();
     if (handlers == nullptr || handlers->abi_version != OEQ_FFI_ABI_VERSION) {
+        return 1;
+    }
+    if (handlers->type_count != 0 && handlers->types == nullptr) {
+        return 1;
+    }
+    for (uint32_t index = 0; index < handlers->type_count; ++index) {
+        const OeqFfiType& type = handlers->types[index];
+        if (type.name == nullptr || type.type_id == nullptr ||
+            type.type_info == nullptr) {
+            return 1;
+        }
+        XLA_FFI_Type_Register_Args args{};
+        args.struct_size = XLA_FFI_Type_Register_Args_STRUCT_SIZE;
+        args.name = {type.name, std::strlen(type.name)};
+        args.type_id = static_cast<XLA_FFI_TypeId*>(type.type_id);
+        args.type_info = static_cast<const XLA_FFI_TypeInfo*>(type.type_info);
+        XLA_FFI_Error* error = api->XLA_FFI_Type_Register(&args);
+        if (error == nullptr) {
+            continue;
+        }
+
+        XLA_FFI_Error_GetMessage_Args message_args{};
+        message_args.struct_size = XLA_FFI_Error_GetMessage_Args_STRUCT_SIZE;
+        message_args.error = error;
+        api->XLA_FFI_Error_GetMessage(&message_args);
+        std::cerr << "OpenEquivariance failed to register FFI type "
+                  << type.name << ": "
+                  << (message_args.message == nullptr
+                          ? "unknown XLA FFI error"
+                          : message_args.message)
+                  << std::endl;
+
+        XLA_FFI_Error_Destroy_Args destroy_args{};
+        destroy_args.struct_size = XLA_FFI_Error_Destroy_Args_STRUCT_SIZE;
+        destroy_args.error = error;
+        api->XLA_FFI_Error_Destroy(&destroy_args);
         return 1;
     }
     for (uint32_t index = 0; index < handlers->handler_count; ++index) {

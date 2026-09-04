@@ -15,6 +15,7 @@ class TensorProduct(LoopUnrollTP):
     """
 
     def __init__(self, problem: TPProblem):
+        extlib.ensure_ffi_registered()
         dp = extlib.DeviceProp(0)
         super().__init__(problem, dp, extlib.IS_HIP, torch_op=False)
 

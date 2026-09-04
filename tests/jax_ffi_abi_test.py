@@ -30,9 +30,19 @@ class _Handler(ctypes.Structure):
     ]
 
 
+class _Type(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char_p),
+        ("type_id", ctypes.c_void_p),
+        ("type_info", ctypes.c_void_p),
+    ]
+
+
 class _HandlerTable(ctypes.Structure):
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
+        ("type_count", ctypes.c_uint32),
+        ("types", ctypes.POINTER(_Type)),
         ("handler_count", ctypes.c_uint32),
         ("handlers", ctypes.POINTER(_Handler)),
     ]
@@ -54,7 +64,7 @@ def _capsule_pointer(capsule):
 
 
 def test_exported_handler_table_matches_manifest(with_jax):
-    """The ABI-v2 table is the ordered source of truth for every target."""
+    """The ABI-v3 table owns the executable state and staged targets."""
     if not with_jax:
         pytest.skip("JAX ABI checks require --jax")
 
@@ -62,12 +72,14 @@ def test_exported_handler_table_matches_manifest(with_jax):
     names = [
         table.handlers[index].name.decode() for index in range(table.handler_count)
     ]
-    assert table.abi_version == 2
+    assert table.abi_version == 3
+    assert table.type_count == 1
+    assert table.types[0].name == b"oeq_executable_state"
+    assert table.types[0].type_id
+    assert table.types[0].type_info
     assert tuple(names) == FFI_TARGETS
     assert len(names) == len(set(names)) == 6
-    assert all(
-        not table.handlers[index].instantiate for index in range(table.handler_count)
-    )
+    assert all(table.handlers[index].instantiate for index in range(table.handler_count))
     assert all(
         not table.handlers[index].prepare for index in range(table.handler_count)
     )
@@ -80,11 +92,20 @@ def test_exported_handler_table_matches_manifest(with_jax):
 
 
 def test_nanobind_registrations_match_handler_table(with_jax):
-    """Nanobind exposes each non-null ABI stage as a capsule."""
+    """Nanobind exposes the ABI table's state type and handler stages."""
     if not with_jax:
         pytest.skip("JAX ABI checks require --jax")
 
     ext, table = _handler_table()
+    type_registrations = ext.type_registrations()
+    assert tuple(type_registrations) == ("oeq_executable_state",)
+    state_registration = type_registrations["oeq_executable_state"]
+    assert _capsule_pointer(state_registration["type_id"]) == table.types[0].type_id
+    assert (
+        _capsule_pointer(state_registration["type_info"])
+        == table.types[0].type_info
+    )
+
     registrations = ext.registrations()
     assert tuple(registrations) == FFI_TARGETS
     assert len(registrations) == table.handler_count == 6
@@ -111,4 +132,5 @@ def test_handler_families_share_one_initializer(with_jax):
         ("tp_forward", "tp_backward", "tp_double_backward"),
         ("conv_forward", "conv_backward", "conv_double_backward"),
     ):
+        assert len({handlers[name].instantiate for name in family}) == 1
         assert len({handlers[name].initialize for name in family}) == 1

@@ -37,6 +37,7 @@ class TensorProductConv(LoopUnrollConv):
         kahan: bool = False,
         requires_jvp: bool = True,
     ):
+        extlib.ensure_ffi_registered()
         dp = extlib.DeviceProp(0)
         self.requires_jvp = requires_jvp
         super().__init__(

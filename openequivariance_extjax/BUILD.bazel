@@ -6,13 +6,17 @@ cc_library(
     name = "ffi_handlers",
     srcs = [
         "src/ffi_handlers.cpp",
+        "src/kernel_compilation.cpp",
         "src/extension/json11/json11.cpp",
     ],
     hdrs = glob([
         "src/extension/**/*.h",
         "src/extension/**/*.hpp",
         "src/extension/**/*.inl",
-    ]) + ["src/ffi_handler_table.h"],
+    ]) + [
+        "src/ffi_handler_table.h",
+        "src/kernel_compilation.h",
+    ],
     alwayslink = True,
     copts = [
         "-std=c++17",

@@ -1,3 +1,5 @@
+import threading
+
 import jax
 import openequivariance_extjax as oeq_extjax
 
@@ -7,8 +9,26 @@ platform = "CUDA"
 if IS_HIP:
     platform = "ROCM"
 
-for name, target in oeq_extjax.registrations().items():
-    jax.ffi.register_ffi_target(name, target, platform=platform, api_version=1)
+if not hasattr(jax.ffi, "register_ffi_type"):
+    raise RuntimeError("OpenEquivariance JAX support requires JAX 0.8.2 or newer")
+
+_registration_lock = threading.Lock()
+_ffi_registered = False
+
+
+def ensure_ffi_registered() -> None:
+    global _ffi_registered
+    with _registration_lock:
+        if _ffi_registered:
+            return
+        jax.devices(platform.lower())
+        for name, registration in oeq_extjax.type_registrations().items():
+            jax.ffi.register_ffi_type(name, registration, platform=platform)
+        for name, target in oeq_extjax.registrations().items():
+            jax.ffi.register_ffi_target(
+                name, target, platform=platform, api_version=1
+            )
+        _ffi_registered = True
 
 GPUTimer = oeq_extjax.GPUTimer
 DeviceProp = oeq_extjax.DeviceProp
@@ -16,4 +36,5 @@ DeviceProp = oeq_extjax.DeviceProp
 __all__ = [
     "GPUTimer",
     "DeviceProp",
+    "ensure_ffi_registered",
 ]

@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#define OEQ_FFI_ABI_VERSION 2
+#define OEQ_FFI_ABI_VERSION 3
 
 #define OEQ_FFI_TRAIT_COMMAND_BUFFER_COMPATIBLE (1u << 0)
 
@@ -29,8 +29,16 @@ typedef struct OeqFfiHandler {
     uint32_t traits;
 } OeqFfiHandler;
 
+typedef struct OeqFfiType {
+    const char* name;
+    void* type_id;
+    const void* type_info;
+} OeqFfiType;
+
 typedef struct OeqFfiHandlerTable {
     uint32_t abi_version;
+    uint32_t type_count;
+    const OeqFfiType* types;
     uint32_t handler_count;
     const OeqFfiHandler* handlers;
 } OeqFfiHandlerTable;

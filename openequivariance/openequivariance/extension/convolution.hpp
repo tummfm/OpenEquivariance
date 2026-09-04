@@ -21,6 +21,15 @@ public:
     KernelLaunchConfig double_backward_config_ref;
     int opt_level; 
 
+#ifdef CUDA_BACKEND
+    static CompiledKernelImage compile_image(
+        const string& jit_kernel, int cu_major, int cu_minor, int opt_level) {
+        vector<string> kernels = {"forward", "backward", "fixup_forward", "fixup_backward", "double_backward_A", "double_backward_B", "fixup_double_backwardB"};
+        return JIT_IMPL::compile_image(
+            jit_kernel, kernels, {{}, {}, {}, {}, {}, {}, {}},
+            cu_major, cu_minor, opt_level);
+    }
+#endif
     JITConvImpl(
         std::string jit_kernel,
         KernelLaunchConfig forward_config_i,
@@ -49,6 +58,31 @@ public:
             jit.set_max_smem(5, double_backward_config_ref.smem);
         }
     }
+
+#ifdef CUDA_BACKEND
+    JITConvImpl(
+        const CompiledKernelImage& image,
+        KernelLaunchConfig forward_config_i,
+        KernelLaunchConfig backward_config_i,
+        KernelLaunchConfig double_backward_config_i,
+        int opt_level_i)
+        : jit(image),
+          forward_config_ref(forward_config_i),
+          backward_config_ref(backward_config_i),
+          double_backward_config_ref(double_backward_config_i),
+          opt_level(opt_level_i) {
+        if(forward_config_ref.smem > 0) {
+            jit.set_max_smem(0, forward_config_ref.smem);
+            jit.set_max_smem(4, forward_config_ref.smem);
+        }
+        if(backward_config_ref.smem > 0) {
+            jit.set_max_smem(1, backward_config_ref.smem);
+        }
+        if(double_backward_config_ref.smem > 0) {
+            jit.set_max_smem(5, double_backward_config_ref.smem);
+        }
+    }
+#endif
 
     JITConvImpl(
             std::string jit_kernel,
